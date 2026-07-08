@@ -54,6 +54,7 @@ ASCII_CR equ 0x0D
 ASCII_BS equ 0x08
 
 CMD_BUFFER_SIZE equ 128
+EXEC_BUFFER_SIZE equ 256
 
 [BITS 32]
 protected_mode_start:
@@ -411,8 +412,92 @@ cmd_echo:
     call print_string
     ret
 
+; --- "run" handler: rsi -> nul-terminated hex-byte string, e.g.
+; "b8 34 12 cd 10 c3". Decodes it straight into exec_buffer and calls
+; into it - no validation of what the bytes actually do, no sandboxing;
+; a bad or missing `ret` will crash or hang the kernel outright. That's
+; the point: this is a deliberately unguarded raw-machine-code runner. ---
+cmd_run:
+    lea rdi, [exec_buffer]
+    xor rcx, rcx
+.parse_loop:
+    call skip_spaces
+    mov al, [rsi]
+    or al, al
+    jz .execute
+    call hex_nibble
+    jc .bad_hex
+    mov bl, al
+    shl bl, 4
+    inc rsi
+    mov al, [rsi]
+    call hex_nibble
+    jc .bad_hex
+    or bl, al
+    inc rsi
+    cmp rcx, EXEC_BUFFER_SIZE
+    jae .too_long
+    mov [rdi + rcx], bl
+    inc rcx
+    jmp .parse_loop
+.execute:
+    or rcx, rcx
+    jz .ret
+    call exec_buffer
+.ret:
+    ret
+.bad_hex:
+    mov rsi, run_bad_hex_msg
+    call print_string
+    ret
+.too_long:
+    mov rsi, run_too_long_msg
+    call print_string
+    ret
+
+; --- Skip spaces at RSI (used between hex byte pairs) ---
+skip_spaces:
+    mov al, [rsi]
+    cmp al, ' '
+    jne .done
+    inc rsi
+    jmp skip_spaces
+.done:
+    ret
+
+; --- Convert ASCII hex digit in AL to its 4-bit value in AL; CF set if
+; AL isn't a valid hex digit. ---
+hex_nibble:
+    cmp al, '0'
+    jb .bad
+    cmp al, '9'
+    jbe .digit
+    cmp al, 'A'
+    jb .bad
+    cmp al, 'F'
+    jbe .upper
+    cmp al, 'a'
+    jb .bad
+    cmp al, 'f'
+    ja .bad
+    sub al, 'a' - 10
+    clc
+    ret
+.upper:
+    sub al, 'A' - 10
+    clc
+    ret
+.digit:
+    sub al, '0'
+    clc
+    ret
+.bad:
+    stc
+    ret
+
 command_table:
     dq echo_cmd, echo_cmd_end - echo_cmd, cmd_echo
+    dq run_cmd, run_cmd_end - run_cmd, cmd_run
     dq 0
 
 ; --- Print a null-terminated string starting at RSI ---
@@ -527,11 +612,19 @@ msg db "Hello, Amethyst!", 0
 prompt db "> ", 0
 echo_cmd db "echo"
 echo_cmd_end:
+run_cmd db "run"
+run_cmd_end:
 unknown_msg db "Unknown command: ", 0
+run_bad_hex_msg db "Invalid hex byte", 0
+run_too_long_msg db "Too many bytes for exec_buffer", 0
 
 cursor_pos dq 0
 cmd_len db 0
 cmd_buffer times CMD_BUFFER_SIZE db 0
+
+; Scratch buffer for `run`'s raw machine code - no execute-permission
+; distinction is set up in the page tables, so this is directly callable.
+exec_buffer times EXEC_BUFFER_SIZE db 0
 shift_state db 0
 caps_lock db 0
 
