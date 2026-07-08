@@ -156,6 +156,6 @@ PML4_ADDR equ 0x1000
 PDPT_ADDR equ 0x2000
 PD_ADDR   equ 0x3000
 
-%include "src/boot/kernel.asm"
+%include "src/kernel/kernel.asm"
 
 times 16384 - ($ - $$) db 0
