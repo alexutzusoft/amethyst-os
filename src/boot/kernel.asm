@@ -9,8 +9,8 @@ VGA_ROWS      equ 25
 VGA_ROW_BYTES equ VGA_COLS * 2
 VGA_SIZE      equ VGA_ROW_BYTES * VGA_ROWS      ; 4000: one byte past the last cell
 VGA_LAST_ROW  equ VGA_ROW_BYTES * (VGA_ROWS - 1) ; 3840: start of the bottom row
-VGA_ATTR      equ 0x0D                            ; light magenta on black
-VGA_ATTR_SEL  equ 0xD0                            ; inverted: black on light magenta (selection highlight)
+VGA_ATTR      equ 0x0F                            ; white on black
+VGA_ATTR_SEL  equ 0xF0                            ; inverted: black on white (selection highlight)
 
 ; --- 8259 PIC ports/values ---
 PIC1_CMD  equ 0x20
@@ -690,7 +690,7 @@ redraw_input_line:
 .have_char:
     mov [rdi], r9b
 
-    mov r10b, VGA_ATTR
+    mov r10b, [text_attr]
     cmp byte [sel_active], 0
     je .store_attr
     cmp rcx, rax
@@ -997,17 +997,20 @@ parse_hex_arg:
 cmd_clear:
     push rax
     push rcx
+    push rdx
     push rdi
     mov rdi, VGA_MEM
     mov rcx, VGA_COLS * VGA_ROWS
+    mov dl, [text_attr]
 .loop:
     mov byte [rdi], ' '
-    mov byte [rdi + 1], VGA_ATTR
+    mov [rdi + 1], dl
     add rdi, 2
     loop .loop
     mov qword [cursor_pos], 0
     call update_cursor
     pop rdi
+    pop rdx
     pop rcx
     pop rax
     ret
@@ -1036,6 +1039,82 @@ cmd_help:
     pop rsi
     pop r11
     pop r9
+    ret
+
+; --- "color" handler: set the foreground/background text attribute.
+; Accepts a preset name (red/green/blue/yellow/white) or a 2-digit HEX
+; attribute byte (high nibble = background, low nibble = foreground). ---
+cmd_color:
+    mov rdi, color_names
+.find_loop:
+    mov rax, [rdi]
+    or rax, rax
+    jz .try_hex
+    mov r9, [rdi + 8]
+    movzx r10, byte [rdi + 16]
+
+    mov r11, rsi
+    mov r8, rax
+    mov rcx, r9
+.cmp_loop:
+    or rcx, rcx
+    jz .name_end_check
+    mov al, [r11]
+    mov bl, [r8]
+    cmp al, bl
+    jne .next_name
+    inc r11
+    inc r8
+    dec rcx
+    jmp .cmp_loop
+.name_end_check:
+    mov al, [r11]
+    or al, al
+    jz .matched
+.next_name:
+    add rdi, 24
+    jmp .find_loop
+.matched:
+    mov [text_attr], r10b
+    call recolor_screen
+    ret
+
+.try_hex:
+    call skip_spaces
+    mov al, [rsi]
+    or al, al
+    jz .ret
+    call hex_nibble
+    jc .ret
+    mov bl, al
+    shl bl, 4
+    inc rsi
+    mov al, [rsi]
+    call hex_nibble
+    jc .ret
+    or bl, al
+    mov [text_attr], bl
+    call recolor_screen
+.ret:
+    ret
+
+; --- overwrite the attribute byte of every cell already on screen ---
+recolor_screen:
+    push rax
+    push rcx
+    push rdx
+    push rdi
+    mov rdi, VGA_MEM
+    mov rcx, VGA_COLS * VGA_ROWS
+    mov dl, [text_attr]
+.loop:
+    mov [rdi + 1], dl
+    add rdi, 2
+    loop .loop
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rax
     ret
 
 ; --- "reboot" handler: 8042 pulse-reset, falling back to a forced triple fault ---
@@ -1959,6 +2038,7 @@ command_table:
     dq uptime_cmd, uptime_cmd_end - uptime_cmd, cmd_uptime
     dq shutdown_cmd, shutdown_cmd_end - shutdown_cmd, cmd_shutdown
     dq acpi_cmd, acpi_cmd_end - acpi_cmd, cmd_acpi
+    dq color_cmd, color_cmd_end - color_cmd, cmd_color
     dq 0
 
 ; --- Print a null-terminated string starting at RSI ---
@@ -2011,7 +2091,8 @@ print_char:
     mov rdi, [cursor_pos]
     add rdi, VGA_MEM
     mov [rdi], al
-    mov byte [rdi + 1], VGA_ATTR
+    mov dl, [text_attr]
+    mov [rdi + 1], dl
     add qword [cursor_pos], 2
     jmp .wrap_check
 
@@ -2033,7 +2114,8 @@ print_char:
     mov rdi, [cursor_pos]
     add rdi, VGA_MEM
     mov byte [rdi], ' '
-    mov byte [rdi + 1], VGA_ATTR
+    mov dl, [text_attr]
+    mov [rdi + 1], dl
     jmp .ret
 
 .wrap_check:
@@ -2058,9 +2140,10 @@ scroll_screen:
 
     mov rdi, VGA_MEM + VGA_LAST_ROW
     mov rcx, VGA_COLS
+    mov dl, [text_attr]
 .clear_loop:
     mov byte [rdi], ' '
-    mov byte [rdi + 1], VGA_ATTR
+    mov [rdi + 1], dl
     add rdi, 2
     loop .clear_loop
 
@@ -2097,6 +2180,8 @@ shutdown_cmd db "shutdown"
 shutdown_cmd_end:
 acpi_cmd db "acpi"
 acpi_cmd_end:
+color_cmd db "color"
+color_cmd_end:
 unknown_msg db "Unknown command: ", 0
 run_bad_hex_msg db "Invalid hex byte", 0
 run_too_long_msg db "Too many bytes for exec_buffer", 0
@@ -2131,11 +2216,34 @@ acpi_valid_msg db " (valid)", 0
 acpi_invalid_msg db " (INVALID)", 0
 acpi_badpkg_msg db "_S5 package decode failed (unexpected AML structure)", 0
 
+; Preset color name table: {name_ptr, name_len, attr_byte}, 17 bytes each,
+; ends with a zero name_ptr. Attr byte = white background (0x7) foreground,
+; matching VGA_ATTR's black-background scheme (0x0_).
+color_names:
+    dq color_red,    color_red_end - color_red,    0x04
+    dq color_green,  color_green_end - color_green, 0x02
+    dq color_blue,   color_blue_end - color_blue,   0x01
+    dq color_yellow, color_yellow_end - color_yellow, 0x0E
+    dq color_white,  color_white_end - color_white, 0x0F
+    dq 0
+
+color_red db "red"
+color_red_end:
+color_green db "green"
+color_green_end:
+color_blue db "blue"
+color_blue_end:
+color_yellow db "yellow"
+color_yellow_end:
+color_white db "white"
+color_white_end:
+
 null_idt_descriptor:
     dw 0
     dq 0
 
 cursor_pos dq 0
+text_attr db VGA_ATTR
 cmd_len db 0
 cmd_buffer times CMD_BUFFER_SIZE db 0
 timer_ticks dq 0
