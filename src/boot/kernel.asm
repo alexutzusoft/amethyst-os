@@ -12,6 +12,8 @@ VGA_LAST_ROW  equ VGA_ROW_BYTES * (VGA_ROWS - 1) ; 3840: start of the bottom row
 VGA_ATTR      equ 0x0F                            ; white on black
 VGA_ATTR_SEL  equ 0xF0                            ; inverted: black on white (selection highlight)
 
+HELP_NAME_WIDTH equ 10
+
 ; --- 8259 PIC ports/values ---
 PIC1_CMD  equ 0x20
 PIC1_DATA equ 0x21
@@ -1015,13 +1017,17 @@ cmd_clear:
     pop rax
     ret
 
-; --- "help" handler: list every command in command_table ---
+; --- "help" handler: list every command in command_table with its description ---
 cmd_help:
-    push r9
-    push r11
+    push rax
+    push rdx
     push rsi
     push rcx
+    push r9
+    push r11
+    push r12
     mov r11, command_table
+    mov r12, command_descriptions
 .loop:
     mov rax, [r11]
     or rax, rax
@@ -1030,15 +1036,33 @@ cmd_help:
     mov rsi, rax
     mov rcx, r9
     call print_len
+    mov rcx, HELP_NAME_WIDTH
+    sub rcx, r9
+    jle .pad_done
+.pad_loop:
     mov al, ' '
     call print_char
+    dec rcx
+    jnz .pad_loop
+.pad_done:
+    mov rsi, help_sep
+    call print_string
+    mov rsi, [r12]
+    mov rcx, [r12 + 8]
+    call print_len
+    mov al, ASCII_CR
+    call print_char
     add r11, 24
+    add r12, 16
     jmp .loop
 .done:
-    pop rcx
-    pop rsi
+    pop r12
     pop r11
     pop r9
+    pop rcx
+    pop rsi
+    pop rdx
+    pop rax
     ret
 
 ; --- "color" handler: set the foreground/background text attribute.
@@ -1083,19 +1107,29 @@ cmd_color:
     call skip_spaces
     mov al, [rsi]
     or al, al
-    jz .ret
+    jz .usage
     call hex_nibble
-    jc .ret
+    jc .usage
     mov bl, al
     shl bl, 4
     inc rsi
     mov al, [rsi]
     call hex_nibble
-    jc .ret
+    jc .usage
     or bl, al
+    inc rsi
+    call skip_spaces
+    mov al, [rsi]
+    or al, al
+    jnz .usage
     mov [text_attr], bl
     call recolor_screen
-.ret:
+    ret
+.usage:
+    mov rsi, color_usage_msg
+    call print_string
+    mov al, ASCII_CR
+    call print_char
     ret
 
 ; --- overwrite the attribute byte of every cell already on screen ---
@@ -2040,6 +2074,54 @@ command_table:
     dq acpi_cmd, acpi_cmd_end - acpi_cmd, cmd_acpi
     dq color_cmd, color_cmd_end - color_cmd, cmd_color
     dq 0
+
+command_descriptions:
+    dq desc_echo,     desc_echo_end - desc_echo
+    dq desc_run,      desc_run_end - desc_run
+    dq desc_clear,    desc_clear_end - desc_clear
+    dq desc_help,     desc_help_end - desc_help
+    dq desc_reboot,   desc_reboot_end - desc_reboot
+    dq desc_halt,     desc_halt_end - desc_halt
+    dq desc_mem,      desc_mem_end - desc_mem
+    dq desc_peek,     desc_peek_end - desc_peek
+    dq desc_poke,     desc_poke_end - desc_poke
+    dq desc_cpuid,    desc_cpuid_end - desc_cpuid
+    dq desc_uptime,   desc_uptime_end - desc_uptime
+    dq desc_shutdown, desc_shutdown_end - desc_shutdown
+    dq desc_acpi,     desc_acpi_end - desc_acpi
+    dq desc_color,    desc_color_end - desc_color
+
+desc_echo db "print the given text"
+desc_echo_end:
+desc_run db "assemble and execute raw hex machine code: run <hex bytes>"
+desc_run_end:
+desc_clear db "clear the screen"
+desc_clear_end:
+desc_help db "list available commands"
+desc_help_end:
+desc_reboot db "reboot the machine"
+desc_reboot_end:
+desc_halt db "halt the CPU"
+desc_halt_end:
+desc_mem db "hexdump memory: mem <addr> <len>"
+desc_mem_end:
+desc_peek db "read a byte from memory: peek <addr>"
+desc_peek_end:
+desc_poke db "write a byte to memory: poke <addr> <value>"
+desc_poke_end:
+desc_cpuid db "run CPUID: cpuid [leaf]"
+desc_cpuid_end:
+desc_uptime db "show system uptime"
+desc_uptime_end:
+desc_shutdown db "power off the machine"
+desc_shutdown_end:
+desc_acpi db "probe and display ACPI power-management tables"
+desc_acpi_end:
+desc_color db "set text color: color <red|green|blue|yellow|white|HH>"
+desc_color_end:
+
+help_sep db " - ", 0
+color_usage_msg db "Usage: color <red|green|blue|yellow|white|HH>", 0
 
 ; --- Print a null-terminated string starting at RSI ---
 print_string:

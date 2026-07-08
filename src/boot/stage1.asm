@@ -23,7 +23,7 @@
 [BITS 16]
 [ORG 0x7C00]
 
-KERNEL_SECTORS equ 16   ; must match tools/build.sh -boot-load-size
+KERNEL_SECTORS equ 32   ; must match tools/build.sh -boot-load-size
 ESP_LBA        equ 2048 ; 1MiB-aligned start of the ESP partition, raw image only
 ESP_SECTORS    equ 2880 ; 1440KB FAT image / 512, raw image only
 CANARY_VALUE   equ 0x5A5AA5A5
@@ -158,4 +158,4 @@ PD_ADDR   equ 0x3000
 
 %include "src/boot/kernel.asm"
 
-times 8192 - ($ - $$) db 0
+times 16384 - ($ - $$) db 0
