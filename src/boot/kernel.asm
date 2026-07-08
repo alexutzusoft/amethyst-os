@@ -23,7 +23,7 @@ PIC2_VECTOR_OFFSET equ 0x28
 ICW3_MASTER        equ 0x04
 ICW3_SLAVE         equ 0x02
 ICW4_8086          equ 0x01
-PIC1_MASK          equ 0xF9   ; unmask IRQ0 (timer) + IRQ1 (keyboard)
+PIC1_MASK          equ 0xFC   ; unmask IRQ0 (timer) + IRQ1 (keyboard)
 PIC2_MASK_ALL      equ 0xFF   ; mask everything on the slave
 
 IRQ0_VECTOR equ 0x20
@@ -56,6 +56,9 @@ ASCII_BS equ 0x08
 CMD_BUFFER_SIZE equ 128
 EXEC_BUFFER_SIZE equ 256
 
+PIT_HZ equ 100
+PIT_DIVISOR equ 11931   ; 1193182 / PIT_HZ, rounded
+
 [BITS 32]
 protected_mode_start:
     mov ax, DATA32_SEG
@@ -72,10 +75,21 @@ protected_mode_start:
     mov ecx, 4 * 1024        ; 4 pages * 4096 bytes / 4 bytes per dword
     rep stosd
 
-    ; PML4[0] -> PDPT, PDPT[0] -> PD, PD[0] -> 2MB identity-mapped page
+    ; PML4[0] -> PDPT, PDPT[0] -> PD, PD[0..511] -> 512 identity 2MB pages (1GB).
+    ; The wider map (vs. a single 2MB page) is so peek/mem/poke and the
+    ; shutdown command's ACPI table scan can touch memory outside the first
+    ; 2MB without page-faulting (there's no page-fault handler installed).
     mov dword [PML4_ADDR], PDPT_ADDR | 0b11   ; present + writable
     mov dword [PDPT_ADDR], PD_ADDR   | 0b11
-    mov dword [PD_ADDR],   0x000000  | 0b10000011 ; present + writable + 2MB page
+
+    mov edi, PD_ADDR
+    mov eax, 0b10000011        ; present + writable + 2MB page, address 0
+    mov ecx, 512
+.map_pd_loop:
+    mov [edi], eax
+    add eax, 0x200000
+    add edi, 8
+    loop .map_pd_loop
 
     mov eax, PML4_ADDR
     mov cr3, eax
@@ -113,6 +127,7 @@ long_mode_start:
     call setup_idt
     call remap_pic
     call enable_kbd_irq
+    call setup_pit
 
     mov al, 0x0D
     call print_char
@@ -159,10 +174,26 @@ write_idt_entry:
 ; defensive EOI alone being sufficient without further interactive testing.
 timer_isr:
     push rax
+    inc qword [timer_ticks]
     mov al, PIC_EOI
     out PIC1_CMD, al
     pop rax
     iretq
+
+; --- Program PIT channel 0 for PIT_HZ square-wave interrupts ---
+setup_pit:
+    push rax
+    mov al, 0x36            ; channel 0, lobyte/hibyte, mode 3
+    out 0x43, al
+    call io_wait
+    mov ax, PIT_DIVISOR
+    out 0x40, al
+    call io_wait
+    mov al, ah
+    out 0x40, al
+    call io_wait
+    pop rax
+    ret
 
 idt_descriptor:
     dw 0x0FFF
@@ -495,9 +526,535 @@ hex_nibble:
     stc
     ret
 
+; --- Print RCX bytes starting at RSI (no null terminator needed) ---
+print_len:
+    or rcx, rcx
+    jz .done
+    mov al, [rsi]
+    call print_char
+    inc rsi
+    dec rcx
+    jmp print_len
+.done:
+    ret
+
+; --- Print AL as two hex digits ---
+print_hex8:
+    push rax
+    mov ah, al
+    shr al, 4
+    call .nibble
+    mov al, ah
+    and al, 0x0F
+    call .nibble
+    pop rax
+    ret
+.nibble:
+    cmp al, 10
+    jb .digit
+    add al, 'A' - 10
+    jmp .out
+.digit:
+    add al, '0'
+.out:
+    call print_char
+    ret
+
+; --- Print RAX as 16 zero-padded hex digits ---
+print_hex64:
+    push rax
+    push rbx
+    push rcx
+    mov rbx, rax
+    mov rcx, 16
+.loop:
+    rol rbx, 4
+    mov al, bl
+    and al, 0x0F
+    cmp al, 10
+    jb .digit
+    add al, 'A' - 10
+    jmp .have
+.digit:
+    add al, '0'
+.have:
+    call print_char
+    dec rcx
+    jnz .loop
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; --- Print RAX as an unsigned decimal number ---
+print_dec64:
+    push rax
+    push rbx
+    push rdx
+    push rsi
+    push rdi
+
+    lea rdi, [dec_buffer + 20]
+    mov byte [rdi], 0
+    mov rbx, 10
+    or rax, rax
+    jnz .conv_loop
+    dec rdi
+    mov byte [rdi], '0'
+    jmp .print
+.conv_loop:
+    or rax, rax
+    jz .print
+    xor rdx, rdx
+    div rbx
+    add dl, '0'
+    dec rdi
+    mov [rdi], dl
+    jmp .conv_loop
+.print:
+    mov rsi, rdi
+    call print_string
+
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rbx
+    pop rax
+    ret
+
+; --- Parse a hex number at RSI into RAX, advancing RSI past it and a single
+; trailing space (if any). Leading spaces are skipped. RAX = 0 if no digits. ---
+parse_hex_arg:
+    push rbx
+    push rcx
+    push rdx
+    call skip_spaces
+    xor rax, rax
+.loop:
+    mov dl, [rsi]
+    or dl, dl
+    jz .done
+    cmp dl, ' '
+    je .trailing_space
+    mov cl, dl
+    push rax
+    mov al, cl
+    call hex_nibble
+    mov bl, al
+    pop rax
+    jc .done
+    shl rax, 4
+    movzx rbx, bl
+    or rax, rbx
+    inc rsi
+    jmp .loop
+.trailing_space:
+    inc rsi
+.done:
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; --- "clear" handler: blank the screen and home the cursor ---
+cmd_clear:
+    push rax
+    push rcx
+    push rdi
+    mov rdi, VGA_MEM
+    mov rcx, VGA_COLS * VGA_ROWS
+.loop:
+    mov byte [rdi], ' '
+    mov byte [rdi + 1], VGA_ATTR
+    add rdi, 2
+    loop .loop
+    mov qword [cursor_pos], 0
+    call update_cursor
+    pop rdi
+    pop rcx
+    pop rax
+    ret
+
+; --- "help" handler: list every command in command_table ---
+cmd_help:
+    push r9
+    push r11
+    push rsi
+    push rcx
+    mov r11, command_table
+.loop:
+    mov rax, [r11]
+    or rax, rax
+    jz .done
+    mov r9, [r11 + 8]
+    mov rsi, rax
+    mov rcx, r9
+    call print_len
+    mov al, ' '
+    call print_char
+    add r11, 24
+    jmp .loop
+.done:
+    pop rcx
+    pop rsi
+    pop r11
+    pop r9
+    ret
+
+; --- "reboot" handler: 8042 pulse-reset, falling back to a forced triple fault ---
+cmd_reboot:
+    mov rsi, reboot_msg
+    call print_string
+    mov al, ASCII_CR
+    call print_char
+    call kbd_wait_input
+    mov al, 0xFE
+    out KBD_CMD_PORT, al
+    lidt [null_idt_descriptor]
+    int3
+.hang:
+    hlt
+    jmp .hang
+
+; --- "halt" handler: stop the CPU for good ---
+cmd_halt:
+    mov rsi, halt_msg
+    call print_string
+    mov al, ASCII_CR
+    call print_char
+    cli
+.hang:
+    hlt
+    jmp .hang
+
+; --- "mem <addr> <len>" handler: hexdump LEN bytes at ADDR, 16 per line ---
+cmd_mem:
+    call parse_hex_arg
+    mov rbx, rax
+    call parse_hex_arg
+    mov rcx, rax
+    xor rdx, rdx
+.byte_loop:
+    or rcx, rcx
+    jz .done
+    mov al, [rbx]
+    call print_hex8
+    mov al, ' '
+    call print_char
+    inc rbx
+    dec rcx
+    inc rdx
+    cmp rdx, 16
+    jne .byte_loop
+    xor rdx, rdx
+    mov al, ASCII_CR
+    call print_char
+    jmp .byte_loop
+.done:
+    ret
+
+; --- "peek <addr>" handler: print the byte at ADDR ---
+cmd_peek:
+    call parse_hex_arg
+    mov al, [rax]
+    call print_hex8
+    ret
+
+; --- "poke <addr> <value>" handler: write VALUE's low byte to ADDR ---
+cmd_poke:
+    call parse_hex_arg
+    mov rbx, rax
+    call parse_hex_arg
+    mov [rbx], al
+    ret
+
+; --- "cpuid [leaf]" handler: leaf 0 prints the vendor string, else raw regs ---
+cmd_cpuid:
+    xor rax, rax
+    cmp byte [rsi], 0
+    je .have_leaf
+    call parse_hex_arg
+.have_leaf:
+    mov r8, rax
+    push rbx
+    cpuid
+    cmp r8, 0
+    jne .dump_regs
+
+    mov [cpuid_vendor], ebx
+    mov [cpuid_vendor + 4], edx
+    mov [cpuid_vendor + 8], ecx
+    mov byte [cpuid_vendor + 12], 0
+    mov rsi, cpuid_vendor
+    call print_string
+    pop rbx
+    ret
+
+.dump_regs:
+    mov r9, rax
+    mov r10, rbx
+    mov r11, rcx
+    push rdx
+    mov rax, r9
+    call print_hex64
+    mov al, ' '
+    call print_char
+    mov rax, r10
+    call print_hex64
+    mov al, ' '
+    call print_char
+    mov rax, r11
+    call print_hex64
+    mov al, ' '
+    call print_char
+    pop rax
+    call print_hex64
+    pop rbx
+    ret
+
+; --- "uptime" handler: seconds elapsed since boot ---
+cmd_uptime:
+    mov rax, [timer_ticks]
+    xor rdx, rdx
+    mov rbx, PIT_HZ
+    div rbx
+    call print_dec64
+    mov rsi, uptime_suffix
+    call print_string
+    ret
+
+; rbx = start addr, r8 = length; returns match addr in rax or 0
+scan_for_rsdp:
+.step:
+    cmp r8, 16
+    jb .none
+    mov rsi, rbx
+    mov rdi, rsdp_sig
+    mov rcx, 8
+    repe cmpsb
+    jne .next
+    mov rsi, rbx
+    mov rcx, 20
+    xor dl, dl
+.sum:
+    add dl, [rsi]
+    inc rsi
+    loop .sum
+    or dl, dl
+    jnz .next
+    mov rax, rbx
+    ret
+.next:
+    add rbx, 16
+    sub r8, 16
+    jmp .step
+.none:
+    xor rax, rax
+    ret
+
+; --- Locate the RSDP in the EBDA or the 0xE0000-0xFFFFF BIOS area.
+; Returns pointer in RAX, or 0 if not found. ---
+find_rsdp:
+    movzx rbx, word [0x40E]
+    shl rbx, 4
+    mov r8, 0x400
+    call scan_for_rsdp
+    or rax, rax
+    jnz .done
+
+    mov rbx, 0xE0000
+    mov r8, 0x20000
+    call scan_for_rsdp
+.done:
+    ret
+
+; --- Walk an RSDT's table pointers for a 4-byte signature.
+; RBX = RSDT address, EDX = signature (e.g. 'FACP'). Returns table
+; address in RAX, or 0 if not found. ---
+find_table:
+    push rcx
+    push rsi
+    push rdx
+    mov eax, [rbx + 4]
+    sub eax, 36
+    xor edx, edx
+    mov ecx, 4
+    div ecx
+    mov ecx, eax
+    pop rdx
+    lea rsi, [rbx + 36]
+.loop:
+    or rcx, rcx
+    jz .none
+    mov eax, [rsi]
+    cmp dword [rax], edx
+    je .found
+    add rsi, 4
+    dec rcx
+    jmp .loop
+.found:
+    pop rsi
+    pop rcx
+    ret
+.none:
+    xor rax, rax
+    pop rsi
+    pop rcx
+    ret
+
+; --- Scan a DSDT for the "_S5_" AML name. RBX = DSDT address.
+; Returns a pointer just past the match in RAX, or 0 if not found. ---
+find_s5:
+    mov eax, [rbx + 4]
+    lea r9, [rbx + rax]
+    sub r9, 4
+    mov rsi, rbx
+.scan:
+    cmp rsi, r9
+    ja .none
+    cmp dword [rsi], '_S5_'
+    je .match
+    inc rsi
+    jmp .scan
+.match:
+    lea rax, [rsi + 4]
+    ret
+.none:
+    xor rax, rax
+    ret
+
+; --- "shutdown" handler: real ACPI S5 power-off via RSDP -> RSDT -> FADT ->
+; DSDT _S5 scan (the standard minimal hobby-OS ACPI shutdown path - no full
+; AML interpreter, and assumes an RSDT is present rather than XSDT-only).
+; Falls back to the common emulator magic shutdown ports, and finally to a
+; plain halt, if any step of the real ACPI path fails. ---
+cmd_shutdown:
+    call find_rsdp
+    or rax, rax
+    jz .fallback_ports
+    mov rbx, rax
+    mov eax, [rbx + 16]         ; RSDT address
+    or eax, eax
+    jz .fallback_ports
+    mov rbx, rax
+
+    mov edx, 'FACP'
+    call find_table
+    or rax, rax
+    jz .fallback_ports
+    mov rbx, rax                 ; rbx = FADT address
+
+    mov eax, [rbx + 64]
+    mov [pm1a_cnt], eax
+    mov eax, [rbx + 68]
+    mov [pm1b_cnt], eax
+    mov eax, [rbx + 40]
+    mov [dsdt_addr], eax
+    mov eax, [rbx + 48]
+    mov [smi_cmd], eax
+    movzx eax, byte [rbx + 52]
+    mov [acpi_enable_val], al
+
+    mov edx, [pm1a_cnt]
+    in ax, dx
+    test al, 1
+    jnz .acpi_enabled
+    mov edx, [smi_cmd]
+    or edx, edx
+    jz .fallback_ports
+    mov al, [acpi_enable_val]
+    out dx, al
+    mov rcx, 1000000
+.wait_enable:
+    mov edx, [pm1a_cnt]
+    in ax, dx
+    test al, 1
+    jnz .acpi_enabled
+    loop .wait_enable
+    jmp .fallback_ports
+.acpi_enabled:
+
+    mov rbx, [dsdt_addr]
+    or rbx, rbx
+    jz .fallback_ports
+    call find_s5
+    or rax, rax
+    jz .fallback_ports
+
+    mov rsi, rax
+    cmp byte [rsi], 0x12
+    jne .fallback_ports
+    inc rsi
+    mov al, [rsi]
+    and al, 0xC0
+    shr al, 6
+    movzx rcx, al
+    add rcx, 2
+    add rsi, rcx
+    mov al, [rsi]
+    cmp al, 0x0A
+    jne .typa_raw
+    inc rsi
+.typa_raw:
+    movzx rax, byte [rsi]
+    mov [slp_typa], rax
+    inc rsi
+    mov al, [rsi]
+    cmp al, 0x0A
+    jne .typb_raw
+    inc rsi
+.typb_raw:
+    movzx rax, byte [rsi]
+    mov [slp_typb], rax
+
+    mov rax, [slp_typa]
+    shl rax, 10
+    or rax, 1 << 13
+    mov edx, [pm1a_cnt]
+    out dx, ax
+
+    mov eax, [pm1b_cnt]
+    or eax, eax
+    jz .after_b
+    mov rax, [slp_typb]
+    shl rax, 10
+    or rax, 1 << 13
+    mov edx, [pm1b_cnt]
+    out dx, ax
+.after_b:
+.fallback_ports:
+    mov dx, 0x604
+    mov ax, 0x2000
+    out dx, ax
+    mov dx, 0xB004
+    mov ax, 0x2000
+    out dx, ax
+    mov dx, 0x4004
+    mov ax, 0x3400
+    out dx, ax
+
+    mov rsi, shutdown_fail_msg
+    call print_string
+    mov al, ASCII_CR
+    call print_char
+    cli
+.hang:
+    hlt
+    jmp .hang
+
 command_table:
     dq echo_cmd, echo_cmd_end - echo_cmd, cmd_echo
     dq run_cmd, run_cmd_end - run_cmd, cmd_run
+    dq clear_cmd, clear_cmd_end - clear_cmd, cmd_clear
+    dq help_cmd, help_cmd_end - help_cmd, cmd_help
+    dq reboot_cmd, reboot_cmd_end - reboot_cmd, cmd_reboot
+    dq halt_cmd, halt_cmd_end - halt_cmd, cmd_halt
+    dq mem_cmd, mem_cmd_end - mem_cmd, cmd_mem
+    dq peek_cmd, peek_cmd_end - peek_cmd, cmd_peek
+    dq poke_cmd, poke_cmd_end - poke_cmd, cmd_poke
+    dq cpuid_cmd, cpuid_cmd_end - cpuid_cmd, cmd_cpuid
+    dq uptime_cmd, uptime_cmd_end - uptime_cmd, cmd_uptime
+    dq shutdown_cmd, shutdown_cmd_end - shutdown_cmd, cmd_shutdown
     dq 0
 
 ; --- Print a null-terminated string starting at RSI ---
@@ -614,13 +1171,52 @@ echo_cmd db "echo"
 echo_cmd_end:
 run_cmd db "run"
 run_cmd_end:
+clear_cmd db "clear"
+clear_cmd_end:
+help_cmd db "help"
+help_cmd_end:
+reboot_cmd db "reboot"
+reboot_cmd_end:
+halt_cmd db "halt"
+halt_cmd_end:
+mem_cmd db "mem"
+mem_cmd_end:
+peek_cmd db "peek"
+peek_cmd_end:
+poke_cmd db "poke"
+poke_cmd_end:
+cpuid_cmd db "cpuid"
+cpuid_cmd_end:
+uptime_cmd db "uptime"
+uptime_cmd_end:
+shutdown_cmd db "shutdown"
+shutdown_cmd_end:
 unknown_msg db "Unknown command: ", 0
 run_bad_hex_msg db "Invalid hex byte", 0
 run_too_long_msg db "Too many bytes for exec_buffer", 0
+reboot_msg db "Rebooting...", 0
+halt_msg db "Halted.", 0
+shutdown_fail_msg db "Shutdown failed - it's now safe to turn off your computer.", 0
+uptime_suffix db " s", 0
+rsdp_sig db "RSD PTR "
+
+null_idt_descriptor:
+    dw 0
+    dq 0
 
 cursor_pos dq 0
 cmd_len db 0
 cmd_buffer times CMD_BUFFER_SIZE db 0
+timer_ticks dq 0
+cpuid_vendor times 13 db 0
+dec_buffer times 21 db 0
+pm1a_cnt dq 0
+pm1b_cnt dq 0
+dsdt_addr dq 0
+smi_cmd dq 0
+acpi_enable_val db 0
+slp_typa dq 0
+slp_typb dq 0
 
 ; Scratch buffer for `run`'s raw machine code - no execute-permission
 ; distinction is set up in the page tables, so this is directly callable.
