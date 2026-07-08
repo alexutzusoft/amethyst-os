@@ -28,6 +28,14 @@ ESP_LBA        equ 2048 ; 1MiB-aligned start of the ESP partition, raw image onl
 ESP_SECTORS    equ 2880 ; 1440KB FAT image / 512, raw image only
 CANARY_VALUE   equ 0x5A5AA5A5
 
+; --- Scratch area for the BIOS memory map (see detect_memory below), between
+; the page-table/IDT pages the kernel claims at 0x1000-0x4FFF and this blob's
+; own load address 0x7C00. Read by `sysinfo ram` in kernel.asm - keep these
+; two files' copies of these equs in sync. ---
+MMAP_COUNT_ADDR   equ 0x5000
+MMAP_ENTRIES_ADDR equ 0x5008
+MMAP_MAX_ENTRIES  equ 64
+
 start:
     cli
     xor ax, ax
@@ -53,6 +61,7 @@ start:
     mov ax, 0x0003          ; set video mode 3 (80x25 text) - clears screen
     int 0x10
 
+    call detect_memory
     call enable_a20
     lgdt [gdt_descriptor]
 
@@ -61,6 +70,40 @@ start:
     mov cr0, eax
 
     jmp CODE32_SEG:protected_mode_start   ; far jump flushes the prefetch queue
+
+; --- BIOS INT 15h, EAX=E820: build a physical memory map into MMAP_ENTRIES_ADDR
+; so `sysinfo ram` can report real installed RAM later - once the kernel is in
+; long mode, BIOS interrupts are no longer reachable, so this has to happen
+; here, before enable_a20/protected mode. ds=es=0 already (set above). ---
+detect_memory:
+    xor ebx, ebx
+    xor bp, bp                     ; bp = entries stored so far
+    mov di, MMAP_ENTRIES_ADDR
+.loop:
+    mov eax, 0xE820
+    mov edx, 0x534D4150             ; 'SMAP'
+    mov ecx, 24
+    int 0x15
+    jc .done                        ; carry set: unsupported, or failed on the first call
+    cmp eax, 0x534D4150
+    jne .done
+
+    mov eax, [di + 8]                ; length low dword
+    or eax, [di + 12]                ; | length high dword - skip bogus zero-length entries
+    jz .skip
+
+    cmp bp, MMAP_MAX_ENTRIES
+    jae .done
+    inc bp
+    add di, 24
+.skip:
+    test ebx, ebx
+    jz .done                        ; ebx=0 after this call: that was the last entry
+    jmp .loop
+.done:
+    movzx eax, bp
+    mov [MMAP_COUNT_ADDR], eax
+    ret
 
 ; --- Fast A20 gate enable (via system control port 0x92) ---
 enable_a20:
