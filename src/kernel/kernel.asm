@@ -2494,6 +2494,98 @@ cmd_acpi:
     call print_char
     ret
 
+; --- "date" handler: prints the RTC date as DD/MM/YYYY ---
+cmd_date:
+    mov al, 0x07
+    call rtc_get
+    call print_dec2
+    mov al, '/'
+    call print_char
+    mov al, 0x08
+    call rtc_get
+    call print_dec2
+    mov al, '/'
+    call print_char
+    mov al, 0x09
+    call rtc_get
+    movzx eax, al
+    add eax, 2000
+    call print_dec64
+    mov al, ASCII_CR
+    call print_char
+    ret
+
+; --- "time" handler: prints the RTC time as HH:MM:SS ---
+cmd_time:
+    mov al, 0x04
+    call rtc_get
+    call print_dec2
+    mov al, ':'
+    call print_char
+    mov al, 0x02
+    call rtc_get
+    call print_dec2
+    mov al, ':'
+    call print_char
+    mov al, 0x00
+    call rtc_get
+    call print_dec2
+    mov al, ASCII_CR
+    call print_char
+    ret
+
+; --- Read CMOS RTC register AL, converting from BCD if needed. Returns
+; the binary value in AL. ---
+rtc_get:
+    push rbx
+    push rcx
+    mov bl, al
+    mov al, 0x0B
+    out 0x70, al
+    in al, 0x71
+    mov ch, al
+    mov al, bl
+    out 0x70, al
+    in al, 0x71
+    test ch, 4
+    jnz .done
+    mov cl, al
+    and cl, 0x0F
+    mov bl, al
+    shr bl, 4
+    mov al, bl
+    mov ah, 0
+    push rcx
+    mov cl, 10
+    mul cl
+    pop rcx
+    add al, cl
+.done:
+    pop rcx
+    pop rbx
+    ret
+
+; --- Print AL (0-99) as a zero-padded two-digit decimal number ---
+print_dec2:
+    push rax
+    push rbx
+    push rdx
+    movzx eax, al
+    mov ebx, 10
+    xor edx, edx
+    div ebx
+    push rdx
+    add al, '0'
+    call print_char
+    pop rdx
+    mov al, dl
+    add al, '0'
+    call print_char
+    pop rdx
+    pop rbx
+    pop rax
+    ret
+
 command_table:
     dq echo_cmd, echo_cmd_end - echo_cmd, cmd_echo
     dq run_cmd, run_cmd_end - run_cmd, cmd_run
@@ -2510,6 +2602,8 @@ command_table:
     dq acpi_cmd, acpi_cmd_end - acpi_cmd, cmd_acpi
     dq color_cmd, color_cmd_end - color_cmd, cmd_color
     dq sysinfo_cmd, sysinfo_cmd_end - sysinfo_cmd, cmd_sysinfo
+    dq date_cmd, date_cmd_end - date_cmd, cmd_date
+    dq time_cmd, time_cmd_end - time_cmd, cmd_time
     dq 0
 
 command_descriptions:
@@ -2528,6 +2622,8 @@ command_descriptions:
     dq desc_acpi,     desc_acpi_end - desc_acpi
     dq desc_color,    desc_color_end - desc_color
     dq desc_sysinfo,  desc_sysinfo_end - desc_sysinfo
+    dq desc_date,     desc_date_end - desc_date
+    dq desc_time,     desc_time_end - desc_time
 
 desc_echo db "print the given text"
 desc_echo_end:
@@ -2559,6 +2655,10 @@ desc_color db "set text color: color <red|green|blue|yellow|white|HH>"
 desc_color_end:
 desc_sysinfo db "show hardware info: sysinfo [cpu|ram|gpu|general]"
 desc_sysinfo_end:
+desc_date db "show the current date"
+desc_date_end:
+desc_time db "show the current time"
+desc_time_end:
 
 help_sep db " - ", 0
 color_usage_msg db "Usage: color <red|green|blue|yellow|white|HH>", 0
@@ -2707,6 +2807,10 @@ color_cmd db "color"
 color_cmd_end:
 sysinfo_cmd db "sysinfo"
 sysinfo_cmd_end:
+date_cmd db "date"
+date_cmd_end:
+time_cmd db "time"
+time_cmd_end:
 unknown_msg db "Unknown command: ", 0
 run_bad_hex_msg db "Invalid hex byte", 0
 run_too_long_msg db "Too many bytes for exec_buffer", 0
