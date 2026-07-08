@@ -10,6 +10,7 @@ VGA_ROW_BYTES equ VGA_COLS * 2
 VGA_SIZE      equ VGA_ROW_BYTES * VGA_ROWS      ; 4000: one byte past the last cell
 VGA_LAST_ROW  equ VGA_ROW_BYTES * (VGA_ROWS - 1) ; 3840: start of the bottom row
 VGA_ATTR      equ 0x0D                            ; light magenta on black
+VGA_ATTR_SEL  equ 0xD0                            ; inverted: black on light magenta (selection highlight)
 
 ; --- 8259 PIC ports/values ---
 PIC1_CMD  equ 0x20
@@ -49,6 +50,10 @@ KBD_SCANCODE_MASK  equ 0x7F
 SC_LSHIFT   equ 0x2A
 SC_RSHIFT   equ 0x36
 SC_CAPSLOCK equ 0x3A
+SC_CTRL     equ 0x1D   ; LCtrl (bare) and RCtrl (0xE0-prefixed) share this base code
+SC_LEFT     equ 0x4B   ; only valid 0xE0-prefixed (set-1 arrows are all extended codes)
+SC_RIGHT    equ 0x4D
+KBD_EXTENDED_PREFIX equ 0xE0
 
 ; --- CRT controller (hardware cursor) ports/registers ---
 CRTC_INDEX       equ 0x3D4
@@ -140,6 +145,8 @@ long_mode_start:
     call print_char
     mov rsi, prompt
     call print_string
+    mov rax, [cursor_pos]
+    mov [line_start_pos], rax
 
     sti
 .idle:
@@ -291,14 +298,25 @@ keyboard_isr:
     in al, KBD_DATA_PORT
     mov bl, al                     ; bl = raw scancode, break bit included
 
+    cmp bl, KBD_EXTENDED_PREFIX
+    jne .not_prefix
+    mov byte [extended_pending], 1
+    jmp .eoi
+.not_prefix:
+
     mov al, bl
     and al, KBD_SCANCODE_MASK       ; base scancode, ignoring make/break
+    cmp byte [extended_pending], 0
+    jne .extended_key
+
     cmp al, SC_LSHIFT
     je .shift_key
     cmp al, SC_RSHIFT
     je .shift_key
     cmp al, SC_CAPSLOCK
     je .capslock_key
+    cmp al, SC_CTRL
+    je .ctrl_key
 
     test bl, KBD_BREAK_BIT
     jnz .eoi                 ; ignore other key-release codes
@@ -340,19 +358,62 @@ keyboard_isr:
     cmp al, ASCII_BS
     je .handle_backspace
 
+    cmp byte [sel_active], 0
+    je .no_sel_replace
+    call delete_selection
+.no_sel_replace:
+
     movzx rcx, byte [cmd_len]
     cmp rcx, CMD_BUFFER_SIZE - 1
     jae .eoi
-    mov [cmd_buffer + rcx], al
-    inc byte [cmd_len]
-    call print_char
+    call insert_char_at_cursor
+    call redraw_input_line
     jmp .eoi
 
 .handle_backspace:
-    cmp byte [cmd_len], 0
+    cmp byte [sel_active], 0
+    jne .backspace_has_sel
+    cmp byte [cmd_cursor], 0
     je .eoi
-    dec byte [cmd_len]
-    call print_char
+    call delete_char_before_cursor
+    jmp .backspace_redraw
+.backspace_has_sel:
+    call delete_selection
+.backspace_redraw:
+    call redraw_input_line
+    jmp .eoi
+
+.extended_key:
+    mov byte [extended_pending], 0
+    cmp al, SC_LEFT
+    je .arrow_left
+    cmp al, SC_RIGHT
+    je .arrow_right
+    cmp al, SC_CTRL             ; RCtrl: 0xE0 0x1D
+    je .ctrl_key
+    jmp .eoi
+
+.arrow_left:
+    test bl, KBD_BREAK_BIT
+    jnz .eoi
+    mov dl, -1
+    call move_cursor_arrow
+    jmp .eoi
+
+.arrow_right:
+    test bl, KBD_BREAK_BIT
+    jnz .eoi
+    mov dl, 1
+    call move_cursor_arrow
+    jmp .eoi
+
+.ctrl_key:
+    test bl, KBD_BREAK_BIT
+    jz .ctrl_make
+    mov byte [ctrl_state], 0
+    jmp .eoi
+.ctrl_make:
+    mov byte [ctrl_state], 1
     jmp .eoi
 
 .shift_key:
@@ -376,8 +437,13 @@ keyboard_isr:
     call print_char
     call process_command
     mov byte [cmd_len], 0
+    mov byte [cmd_cursor], 0
+    mov byte [sel_active], 0
+    mov byte [cmd_render_len], 0
     mov rsi, prompt
     call print_string
+    mov rax, [cursor_pos]
+    mov [line_start_pos], rax
 
 .eoi:
     mov al, PIC_EOI
@@ -389,6 +455,270 @@ keyboard_isr:
     pop rbx
     pop rax
     iretq
+
+; --- Insert AL at cmd_buffer[cmd_cursor], shifting the tail right by one byte,
+; then advance cmd_len and cmd_cursor. Caller has already verified cmd_len is
+; below CMD_BUFFER_SIZE - 1 and resolved any active selection. Clobbers
+; rax/rcx/rsi/rdi (all caller-saved by keyboard_isr already). ---
+insert_char_at_cursor:
+    push rbx
+    mov bl, al                     ; save char across the shift loop
+    movzx rcx, byte [cmd_len]
+    movzx rdi, byte [cmd_cursor]
+    ; shift cmd_buffer[cmd_cursor..cmd_len] right by one, from the end backward
+    cmp rcx, rdi
+    je .no_shift
+    lea rsi, [cmd_buffer + rcx]     ; rsi -> one past the last char
+.shift_loop:
+    mov al, [rsi - 1]
+    mov [rsi], al
+    dec rsi
+    dec rcx
+    cmp rcx, rdi
+    jne .shift_loop
+.no_shift:
+    mov [cmd_buffer + rdi], bl
+    inc byte [cmd_len]
+    inc byte [cmd_cursor]
+    pop rbx
+    ret
+
+; --- Delete the character immediately before cmd_cursor, shifting the tail
+; left by one byte. Caller ensures cmd_cursor > 0. ---
+delete_char_before_cursor:
+    movzx rcx, byte [cmd_cursor]
+    movzx rdx, byte [cmd_len]
+    dec rcx                        ; index of the char being removed
+    mov rsi, rcx
+.shift_loop:
+    cmp rsi, rdx
+    jae .done
+    mov al, [cmd_buffer + rsi + 1]
+    mov [cmd_buffer + rsi], al
+    inc rsi
+    jmp .shift_loop
+.done:
+    dec byte [cmd_len]
+    dec byte [cmd_cursor]
+    ret
+
+; --- Remove the range [min(sel_anchor,cmd_cursor), max(...)) from cmd_buffer,
+; shifting the tail left, then clear the selection and place cmd_cursor at
+; the start of the removed range. ---
+delete_selection:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+
+    movzx rax, byte [sel_anchor]
+    movzx rcx, byte [cmd_cursor]
+    cmp rax, rcx
+    jbe .have_range
+    xchg rax, rcx
+.have_range:
+    ; rax = range start, rcx = range end (exclusive)
+    movzx rdx, byte [cmd_len]
+    mov rsi, rax
+.shift_loop:
+    cmp rsi, rdx
+    jae .done_shift
+    mov r8, rsi
+    add r8, rcx
+    sub r8, rax                    ; r8 = source index = rsi + (end - start)
+    cmp r8, rdx
+    jae .pad_zero
+    mov r9b, [cmd_buffer + r8]
+    jmp .store
+.pad_zero:
+    xor r9b, r9b
+.store:
+    mov [cmd_buffer + rsi], r9b
+    inc rsi
+    jmp .shift_loop
+.done_shift:
+    sub rdx, rcx
+    add rdx, rax                    ; new length = old_len - (end - start)
+    mov [cmd_len], dl
+    mov [cmd_cursor], al
+    mov byte [sel_active], 0
+
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; --- Move cmd_cursor by one key-press worth in the direction in DL (+1/-1),
+; honoring ctrl_state (whitespace-delimited word jump) and shift_state
+; (extend/start/clear selection), then redraw. ---
+move_cursor_arrow:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+
+    movsx rdx, dl                   ; sign-extend direction to full width
+    movzx rax, byte [cmd_cursor]
+    movzx rcx, byte [cmd_len]
+
+    cmp byte [ctrl_state], 0
+    jne .word_jump
+    add rax, rdx
+    jmp .clamp
+
+.word_jump:
+    cmp rdx, 0
+    jl .word_left
+    ; skip current run of non-spaces, then following run of spaces
+.word_right_skip_word:
+    cmp rax, rcx
+    jae .clamp
+    cmp byte [cmd_buffer + rax], ' '
+    je .word_right_skip_spaces
+    inc rax
+    jmp .word_right_skip_word
+.word_right_skip_spaces:
+    cmp rax, rcx
+    jae .clamp
+    cmp byte [cmd_buffer + rax], ' '
+    jne .clamp
+    inc rax
+    jmp .word_right_skip_spaces
+
+.word_left:
+    cmp rax, 0
+    je .clamp
+    dec rax
+.word_left_skip_spaces:
+    cmp rax, 0
+    je .clamp
+    cmp byte [cmd_buffer + rax], ' '
+    jne .word_left_skip_word
+    dec rax
+    jmp .word_left_skip_spaces
+.word_left_skip_word:
+    cmp rax, 0
+    je .clamp
+    cmp byte [cmd_buffer + rax - 1], ' '
+    je .clamp
+    dec rax
+    jmp .word_left_skip_word
+
+.clamp:
+    cmp rax, 0
+    jge .clamp_high
+    xor rax, rax
+.clamp_high:
+    cmp rax, rcx
+    jle .have_new_cursor
+    mov rax, rcx
+.have_new_cursor:
+    ; rax = new cursor index
+
+    cmp byte [shift_state], 0
+    jne .shift_held
+    mov byte [sel_active], 0
+    jmp .apply
+
+.shift_held:
+    cmp byte [sel_active], 0
+    jne .apply
+    mov byte [sel_active], 1
+    movzx rsi, byte [cmd_cursor]
+    mov [sel_anchor], sil
+
+.apply:
+    mov [cmd_cursor], al
+    call redraw_input_line
+
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; --- Repaint cmd_buffer[0..cmd_len] at line_start_pos, one VGA cell per
+; character, using VGA_ATTR_SEL for any index within the active selection.
+; Pads any leftover cells from a previous longer render with spaces, then
+; places the hardware cursor at cmd_cursor. ---
+redraw_input_line:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rdi
+
+    movzx rcx, byte [cmd_len]
+    movzx rdx, byte [cmd_render_len]
+    cmp rcx, rdx
+    jbe .have_pad_len
+    mov rdx, rcx
+.have_pad_len:
+    ; rdx = max(cmd_len, previous cmd_render_len) = number of cells to touch
+
+    cmp byte [sel_active], 0
+    je .no_selection
+    movzx rax, byte [sel_anchor]
+    movzx rbx, byte [cmd_cursor]
+    cmp rax, rbx
+    jbe .sel_ready
+    xchg rax, rbx
+.sel_ready:
+    jmp .have_sel
+.no_selection:
+    xor rax, rax
+    xor rbx, rbx
+.have_sel:
+    ; rax = sel start, rbx = sel end (exclusive); equal when no selection
+
+    xor rcx, rcx
+.loop:
+    cmp rcx, rdx
+    jae .done
+    mov rdi, [line_start_pos]
+    lea rdi, [rdi + rcx * 2]
+    add rdi, VGA_MEM
+
+    movzx r8, byte [cmd_len]
+    cmp rcx, r8
+    jae .blank_cell
+    mov r9b, [cmd_buffer + rcx]
+    jmp .have_char
+.blank_cell:
+    mov r9b, ' '
+.have_char:
+    mov [rdi], r9b
+
+    mov r10b, VGA_ATTR
+    cmp byte [sel_active], 0
+    je .store_attr
+    cmp rcx, rax
+    jb .store_attr
+    cmp rcx, rbx
+    jae .store_attr
+    mov r10b, VGA_ATTR_SEL
+.store_attr:
+    mov [rdi + 1], r10b
+
+    inc rcx
+    jmp .loop
+.done:
+    movzx rax, byte [cmd_len]
+    mov [cmd_render_len], al
+
+    mov rax, [line_start_pos]
+    movzx rbx, byte [cmd_cursor]
+    lea rax, [rax + rbx * 2]
+    mov [cursor_pos], rax
+    call update_cursor
+
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
 
 ; --- Look up cmd_buffer in command_table and dispatch to its handler.
 ; Each table entry is {name_ptr, name_len, handler_ptr}, 24 bytes, and the
@@ -1826,6 +2156,13 @@ slp_typb dq 0
 exec_buffer times EXEC_BUFFER_SIZE db 0
 shift_state db 0
 caps_lock db 0
+ctrl_state db 0
+extended_pending db 0
+cmd_cursor db 0
+sel_active db 0
+sel_anchor db 0
+cmd_render_len db 0
+line_start_pos dq 0
 
 ; US QWERTY set-1 scancode -> lowercase ASCII (0 = unmapped/ignored)
 scancode_table:
