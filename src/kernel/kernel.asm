@@ -62,6 +62,10 @@ SC_CAPSLOCK equ 0x3A
 SC_CTRL     equ 0x1D   ; LCtrl (bare) and RCtrl (0xE0-prefixed) share this base code
 SC_LEFT     equ 0x4B   ; only valid 0xE0-prefixed (set-1 arrows are all extended codes)
 SC_RIGHT    equ 0x4D
+SC_UP       equ 0x48
+SC_DOWN     equ 0x50
+
+HIST_ROWS equ 200
 KBD_EXTENDED_PREFIX equ 0xE0
 
 ; --- CRT controller (hardware cursor) ports/registers ---
@@ -69,6 +73,8 @@ CRTC_INDEX       equ 0x3D4
 CRTC_DATA        equ 0x3D5
 CRTC_CURSOR_LOW  equ 0x0F
 CRTC_CURSOR_HIGH equ 0x0E
+CRTC_CURSOR_START equ 0x0A
+CRTC_CURSOR_DISABLE_BIT equ 0x20
 
 ; --- ASCII control characters ---
 ASCII_CR equ 0x0D
@@ -362,6 +368,10 @@ keyboard_isr:
     add al, 0x20              ; caps + shift: uppercase letter -> lowercase
 .no_caps_adjust:
 
+    push rax
+    call snap_scroll_to_live
+    pop rax
+
     cmp al, ASCII_CR
     je .handle_enter
     cmp al, ASCII_BS
@@ -398,13 +408,30 @@ keyboard_isr:
     je .arrow_left
     cmp al, SC_RIGHT
     je .arrow_right
+    cmp al, SC_UP
+    je .arrow_up
+    cmp al, SC_DOWN
+    je .arrow_down
     cmp al, SC_CTRL             ; RCtrl: 0xE0 0x1D
     je .ctrl_key
+    jmp .eoi
+
+.arrow_up:
+    test bl, KBD_BREAK_BIT
+    jnz .eoi
+    call scroll_view_up
+    jmp .eoi
+
+.arrow_down:
+    test bl, KBD_BREAK_BIT
+    jnz .eoi
+    call scroll_view_down
     jmp .eoi
 
 .arrow_left:
     test bl, KBD_BREAK_BIT
     jnz .eoi
+    call snap_scroll_to_live
     mov dl, -1
     call move_cursor_arrow
     jmp .eoi
@@ -412,6 +439,7 @@ keyboard_isr:
 .arrow_right:
     test bl, KBD_BREAK_BIT
     jnz .eoi
+    call snap_scroll_to_live
     mov dl, 1
     call move_cursor_arrow
     jmp .eoi
@@ -2704,8 +2732,52 @@ update_cursor:
     pop rax
     ret
 
+; --- Hide the hardware text-mode cursor (used while scrolled into history) ---
+hide_cursor:
+    push rax
+    push rdx
+
+    mov dx, CRTC_INDEX
+    mov al, CRTC_CURSOR_START
+    out dx, al
+    mov dx, CRTC_DATA
+    in al, dx
+    mov [cursor_start_shape], al
+
+    mov dx, CRTC_INDEX
+    mov al, CRTC_CURSOR_START
+    out dx, al
+    mov dx, CRTC_DATA
+    mov al, CRTC_CURSOR_DISABLE_BIT
+    out dx, al
+
+    pop rdx
+    pop rax
+    ret
+
+; --- Show the hardware text-mode cursor and place it back at cursor_pos ---
+show_cursor:
+    push rax
+    push rdx
+
+    mov dx, CRTC_INDEX
+    mov al, CRTC_CURSOR_START
+    out dx, al
+    mov dx, CRTC_DATA
+    mov al, [cursor_start_shape]
+    out dx, al
+
+    pop rdx
+    pop rax
+    call update_cursor
+    ret
+
 ; --- Print one character in AL to the VGA buffer, tracking cursor_pos ---
 print_char:
+    push rax
+    call snap_scroll_to_live
+    pop rax
+
     cmp al, ASCII_CR
     je .newline
     cmp al, ASCII_BS
@@ -2750,11 +2822,32 @@ print_char:
     call update_cursor
     ret
 
-; --- Scroll the VGA text buffer up one row, clearing the new bottom row ---
+; --- Scroll the VGA text buffer up one row, clearing the new bottom row.
+; Saves the row about to be discarded into the history ring buffer. ---
 scroll_screen:
     push rsi
     push rdi
     push rcx
+
+    ; save row 0 (about to scroll off) into history[hist_write % HIST_ROWS]
+    movzx rax, word [hist_write]
+    xor rdx, rdx
+    mov rcx, HIST_ROWS
+    div rcx                    ; rdx = hist_write mod HIST_ROWS
+    mov rax, rdx
+    mov rcx, VGA_ROW_BYTES
+    mul rcx
+    lea rdi, [history_buffer + rax]
+    mov rsi, VGA_MEM
+    push rcx
+    mov rcx, VGA_ROW_BYTES
+    rep movsb
+    pop rcx
+    inc word [hist_write]
+    cmp word [hist_count], HIST_ROWS
+    jae .hist_count_capped
+    inc word [hist_count]
+.hist_count_capped:
 
     mov rsi, VGA_MEM + VGA_ROW_BYTES
     mov rdi, VGA_MEM
@@ -2764,15 +2857,195 @@ scroll_screen:
     mov rdi, VGA_MEM + VGA_LAST_ROW
     mov rcx, VGA_COLS
     mov dl, [text_attr]
-.clear_loop:
+.clear_loop2:
     mov byte [rdi], ' '
     mov [rdi + 1], dl
     add rdi, 2
-    loop .clear_loop
+    loop .clear_loop2
 
     pop rcx
     pop rdi
     pop rsi
+    ret
+
+; --- Copy history row (hist_write - scroll_offset - rowIndexFromTop) into
+; VGA row `vga_row` (0-based), or blank it if that far back has no data. ---
+render_history_row:
+    ; in: rax = rows-back-from-live-top (0 = most recent scrolled-off row), rbx = vga_row
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+
+    movzx rcx, word [hist_count]
+    cmp rax, rcx
+    jae .blank_row
+
+    movzx rcx, word [hist_write]
+    sub rcx, 1
+    sub rcx, rax                ; rcx = absolute history index (may underflow mod HIST_ROWS)
+    xor rdx, rdx
+    push rax
+    mov rax, rcx
+    mov rcx, HIST_ROWS
+    idiv rcx
+    mov rcx, rdx
+    pop rax
+    cmp rcx, 0
+    jge .have_index
+    add rcx, HIST_ROWS
+.have_index:
+    mov rax, rcx
+    mov rcx, VGA_ROW_BYTES
+    mul rcx
+    lea rsi, [history_buffer + rax]
+    mov rax, rbx
+    mov rcx, VGA_ROW_BYTES
+    mul rcx
+    lea rdi, [VGA_MEM + rax]
+    mov rcx, VGA_ROW_BYTES
+    rep movsb
+    jmp .done
+
+.blank_row:
+    mov rax, rbx
+    mov rcx, VGA_ROW_BYTES
+    mul rcx
+    lea rdi, [VGA_MEM + rax]
+    mov rcx, VGA_COLS
+    mov dl, VGA_ATTR
+.blank_loop:
+    mov byte [rdi], ' '
+    mov [rdi + 1], dl
+    add rdi, 2
+    loop .blank_loop
+
+.done:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    ret
+
+; --- Rebuild the full VGA_MEM screen for the current scroll_offset: rows
+; above the live buffer come from history_buffer (older toward the top),
+; the rest are copied from live_shadow (the true, unscrolled live screen). ---
+repaint_scrolled_view:
+    push rax
+    push rbx
+    push rcx
+    push rsi
+    push rdi
+
+    xor rbx, rbx
+.row_loop:
+    cmp rbx, VGA_ROWS
+    jae .row_done
+    movzx rax, word [scroll_offset]
+    cmp rbx, rax
+    jae .live_row
+    ; history row: rows_back = scroll_offset - rbx - 1 (0 = most recent)
+    sub rax, rbx
+    dec rax
+    call render_history_row
+    jmp .row_next
+.live_row:
+    ; copy the corresponding row from live_shadow (row = rbx - scroll_offset)
+    mov rax, rbx
+    movzx rcx, word [scroll_offset]
+    sub rax, rcx
+    mov rcx, VGA_ROW_BYTES
+    mul rcx
+    lea rsi, [live_shadow + rax]
+    mov rax, rbx
+    mov rcx, VGA_ROW_BYTES
+    mul rcx
+    lea rdi, [VGA_MEM + rax]
+    mov rcx, VGA_ROW_BYTES
+    rep movsb
+.row_next:
+    inc rbx
+    jmp .row_loop
+.row_done:
+    pop rdi
+    pop rsi
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; --- Scroll the view one row further into history (toward older output). ---
+scroll_view_up:
+    push rax
+
+    movzx rax, word [scroll_offset]
+    cmp ax, [hist_count]
+    jae .done
+    cmp word [scroll_offset], 0
+    jne .not_first
+    call save_live_shadow
+    call hide_cursor
+.not_first:
+    inc word [scroll_offset]
+    call repaint_scrolled_view
+
+.done:
+    pop rax
+    ret
+
+; --- Scroll the view one row toward the live output; snaps to live at 0. ---
+scroll_view_down:
+    cmp word [scroll_offset], 0
+    je .done
+    dec word [scroll_offset]
+    cmp word [scroll_offset], 0
+    jne .repaint
+    call restore_live_shadow
+    call show_cursor
+    jmp .done
+.repaint:
+    call repaint_scrolled_view
+.done:
+    ret
+
+; --- Snapshot the live VGA screen into live_shadow before it gets
+; overwritten by history rows. ---
+save_live_shadow:
+    push rsi
+    push rdi
+    push rcx
+    mov rsi, VGA_MEM
+    mov rdi, live_shadow
+    mov rcx, VGA_SIZE
+    rep movsb
+    pop rcx
+    pop rdi
+    pop rsi
+    ret
+
+; --- Restore the live VGA screen from live_shadow. ---
+restore_live_shadow:
+    push rsi
+    push rdi
+    push rcx
+    mov rsi, live_shadow
+    mov rdi, VGA_MEM
+    mov rcx, VGA_SIZE
+    rep movsb
+    pop rcx
+    pop rdi
+    pop rsi
+    ret
+
+; --- If the view is scrolled into history, snap back to live before any
+; input mutates the live buffer. ---
+snap_scroll_to_live:
+    cmp word [scroll_offset], 0
+    je .done
+    mov word [scroll_offset], 0
+    call restore_live_shadow
+    call show_cursor
+.done:
     ret
 
 msg db "Hello, Amethyst!", 0
@@ -2930,6 +3203,12 @@ sel_active db 0
 sel_anchor db 0
 cmd_render_len db 0
 line_start_pos dq 0
+scroll_offset dw 0
+cursor_start_shape db 0
+hist_write dw 0
+hist_count dw 0
+history_buffer times HIST_ROWS * VGA_ROW_BYTES db 0
+live_shadow times VGA_SIZE db 0
 
 ; US QWERTY set-1 scancode -> lowercase ASCII (0 = unmapped/ignored)
 scancode_table:
