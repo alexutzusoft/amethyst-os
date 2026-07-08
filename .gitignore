@@ -1,1 +1,8 @@
 build/
+
+# AI Agents
+CLAUDE.md
+KLAT.md
+GEMINI.md
+CODEX.md
+AGENTS.md
