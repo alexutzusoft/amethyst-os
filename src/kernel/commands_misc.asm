@@ -72,6 +72,146 @@ cmd_draw:
     call print_string
     ret
 
+; --- RSI = input string. If it starts with "sqrt" followed by a space or
+; end of string, advances RSI past "sqrt" (and the space, if any) and
+; returns CF=1. Otherwise RSI is unchanged and CF=0. Clobbers rax; saves
+; and restores rbx/rdi/rsi (the pushed rsi is only popped on no-match). ---
+calc_match_sqrt_token:
+    push rbx
+    push rdi
+    push rsi
+    mov rdi, calc_sqrt_str
+.loop:
+    mov al, [rsi]
+    mov bl, [rdi]
+    or bl, bl
+    jz .name_end
+    cmp al, bl
+    jne .no_match
+    inc rsi
+    inc rdi
+    jmp .loop
+.name_end:
+    cmp al, ' '
+    je .match_space
+    or al, al
+    jz .match_end
+    jmp .no_match
+.match_space:
+    inc rsi
+.match_end:
+    add rsp, 8
+    pop rdi
+    pop rbx
+    stc
+    ret
+.no_match:
+    pop rsi
+    pop rdi
+    pop rbx
+    clc
+    ret
+
+cmd_calc:
+    call skip_spaces
+    call calc_match_sqrt_token
+    jc .prefix_sqrt
+
+    call parse_dec_arg
+    mov rbx, rax
+    call skip_spaces
+
+    call calc_match_sqrt_token
+    jc .do_sqrt
+
+    mov al, [rsi]
+    or al, al
+    jz .usage
+    mov r8b, al
+    inc rsi
+    cmp byte [rsi], ' '
+    je .have_op
+    cmp byte [rsi], 0
+    jne .usage
+.have_op:
+    call parse_dec_arg
+    mov rcx, rax
+
+    cmp r8b, '+'
+    je .do_add
+    cmp r8b, '-'
+    je .do_sub
+    cmp r8b, '*'
+    je .do_mul
+    cmp r8b, '/'
+    je .do_div
+    cmp r8b, '%'
+    je .do_mod
+    jmp .usage
+
+.do_add:
+    mov rax, rbx
+    add rax, rcx
+    jmp .print
+.do_sub:
+    mov rax, rbx
+    sub rax, rcx
+    jmp .print
+.do_mul:
+    mov rax, rbx
+    imul rax, rcx
+    jmp .print
+.do_div:
+    or rcx, rcx
+    jz .divzero
+    mov rax, rbx
+    cqo
+    idiv rcx
+    jmp .print
+.do_mod:
+    or rcx, rcx
+    jz .divzero
+    mov rax, rbx
+    cqo
+    idiv rcx
+    mov rax, rdx
+    jmp .print
+
+.prefix_sqrt:
+    call parse_dec_arg
+    mov rbx, rax
+.do_sqrt:
+    cmp rbx, 0
+    jl .neg_sqrt
+    mov rax, rbx
+    call isqrt64
+    jmp .print
+
+.print:
+    call print_dec64_signed
+    mov al, ASCII_CR
+    call print_char
+    ret
+
+.divzero:
+    mov rsi, calc_divzero_msg
+    call print_string
+    mov al, ASCII_CR
+    call print_char
+    ret
+.neg_sqrt:
+    mov rsi, calc_neg_sqrt_msg
+    call print_string
+    mov al, ASCII_CR
+    call print_char
+    ret
+.usage:
+    mov rsi, calc_usage_msg
+    call print_string
+    mov al, ASCII_CR
+    call print_char
+    ret
+
 ; --- Read CMOS RTC register AL, converting from BCD if needed. Returns
 ; the binary value in AL. ---
 rtc_get:

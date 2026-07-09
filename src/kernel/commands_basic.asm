@@ -215,6 +215,96 @@ parse_hex_arg:
     pop rbx
     ret
 
+parse_dec_arg:
+    push rbx
+    push rcx
+    push rdx
+    call skip_spaces
+    xor rax, rax
+    xor cl, cl
+    mov dl, [rsi]
+    cmp dl, '-'
+    jne .no_sign
+    mov cl, 1
+    inc rsi
+.no_sign:
+.loop:
+    mov dl, [rsi]
+    or dl, dl
+    jz .done
+    cmp dl, ' '
+    je .trailing_space
+    cmp dl, '0'
+    jb .done
+    cmp dl, '9'
+    ja .done
+    sub dl, '0'
+    imul rax, rax, 10
+    movzx rbx, dl
+    add rax, rbx
+    inc rsi
+    jmp .loop
+.trailing_space:
+    inc rsi
+.done:
+    cmp cl, 0
+    je .positive
+    neg rax
+.positive:
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+print_dec64_signed:
+    push rax
+    or rax, rax
+    jns .positive
+    push rax
+    mov al, '-'
+    call print_char
+    pop rax
+    neg rax
+.positive:
+    call print_dec64
+    pop rax
+    ret
+
+isqrt64:
+    push rbx
+    push rcx
+    push rdx
+    mov rbx, rax
+    xor rax, rax
+    mov rcx, 0x4000000000000000
+.find_bit:
+    cmp rcx, rbx
+    jbe .have_bit
+    shr rcx, 2
+    jmp .find_bit
+.have_bit:
+.loop:
+    or rcx, rcx
+    jz .done
+    mov rdx, rax
+    add rdx, rcx
+    cmp rbx, rdx
+    jb .skip
+    sub rbx, rdx
+    shr rax, 1
+    add rax, rcx
+    jmp .next
+.skip:
+    shr rax, 1
+.next:
+    shr rcx, 2
+    jmp .loop
+.done:
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
 ; --- "clear" handler: blank the screen and home the cursor ---
 cmd_clear:
     push rax

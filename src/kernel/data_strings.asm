@@ -33,6 +33,8 @@ time_cmd db "time"
 time_cmd_end:
 draw_cmd db "draw"
 draw_cmd_end:
+calc_cmd db "calc"
+calc_cmd_end:
 cursor_cmd db "cursor"
 cursor_cmd_end:
 unknown_msg db "Unknown command: ", 0

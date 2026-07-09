@@ -18,6 +18,7 @@ command_table:
     dq time_cmd, time_cmd_end - time_cmd, cmd_time
     dq cursor_cmd, cursor_cmd_end - cursor_cmd, cmd_cursor_toggle
     dq draw_cmd, draw_cmd_end - draw_cmd, cmd_draw
+    dq calc_cmd, calc_cmd_end - calc_cmd, cmd_calc
     dq 0
 
 command_descriptions:
@@ -40,6 +41,7 @@ command_descriptions:
     dq desc_time,     desc_time_end - desc_time
     dq desc_cursor,   desc_cursor_end - desc_cursor
     dq desc_draw,     desc_draw_end - desc_draw
+    dq desc_calc,     desc_calc_end - desc_calc
 
 desc_echo db "print the given text"
 desc_echo_end:
@@ -79,6 +81,8 @@ desc_cursor db "experimental: toggle the PS/2 mouse cell cursor: cursor <on|off>
 desc_cursor_end:
 desc_draw db "show a fun ASCII drawing: draw [gem|cat|amethyst_text]"
 desc_draw_end:
+desc_calc db "basic arithmetic: calc <a> <+|-|*|/|%|sqrt> [b]"
+desc_calc_end:
 
 help_sep db " - ", 0
 color_usage_msg db "Usage: color <red|green|blue|yellow|white|HH>", 0
@@ -86,6 +90,11 @@ sysinfo_usage_msg db "Usage: sysinfo <cpu|ram|gpu|general>", 0
 cursor_usage_msg db "Usage: cursor <on|off>", 0
 cursor_on_msg db "Cursor on (experimental).", 0
 cursor_off_msg db "Cursor off.", 0
+
+calc_usage_msg db "Usage: calc <a> <+|-|*|/|%|sqrt> [b]", 0
+calc_divzero_msg db "Division by zero", 0
+calc_neg_sqrt_msg db "Cannot take sqrt of a negative number", 0
+calc_sqrt_str db "sqrt", 0
 
 draw_usage_msg db "Usage: draw <gem|cat|amethyst_text>", 0
 draw_gem_str db "gem", 0
