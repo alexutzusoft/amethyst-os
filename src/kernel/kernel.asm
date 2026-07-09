@@ -26,11 +26,12 @@ PIC2_VECTOR_OFFSET equ 0x28
 ICW3_MASTER        equ 0x04
 ICW3_SLAVE         equ 0x02
 ICW4_8086          equ 0x01
-PIC1_MASK          equ 0xFC   ; unmask IRQ0 (timer) + IRQ1 (keyboard)
-PIC2_MASK_ALL      equ 0xFF   ; mask everything on the slave
+PIC1_MASK          equ 0xF8   ; unmask IRQ0 (timer) + IRQ1 (keyboard) + IRQ2 (slave cascade)
+PIC2_MASK_ALL      equ 0xEF   ; unmask IRQ12 (PS/2 mouse) on the slave
 
-IRQ0_VECTOR equ 0x20
-IRQ1_VECTOR equ 0x21
+IRQ0_VECTOR  equ 0x20
+IRQ1_VECTOR  equ 0x21
+IRQ12_VECTOR equ 0x2C
 
 ; --- Only the first 1GB is identity-mapped (see protected_mode_start), and
 ; there is no page-fault handler - so any pointer read out of an ACPI table
@@ -64,6 +65,24 @@ SC_LEFT     equ 0x4B   ; only valid 0xE0-prefixed (set-1 arrows are all extended
 SC_RIGHT    equ 0x4D
 SC_UP       equ 0x48
 SC_DOWN     equ 0x50
+
+; --- PS/2 aux (mouse) port, cursor experimental feature ---
+PS2_CMD_ENABLE_AUX          equ 0xA8
+PS2_CMD_WRITE_AUX           equ 0xD4
+MOUSE_CMD_ENABLE_REPORTING  equ 0xF4
+MOUSE_CMD_DISABLE_REPORTING equ 0xF5
+KBD_IRQ12_ENABLE_BIT        equ 0x02
+KBD_STATUS_AUX_DATA         equ 0x20
+MOUSE_ALWAYS1_BIT equ 0x08
+MOUSE_SIGN_X      equ 0x10
+MOUSE_SIGN_Y      equ 0x20
+MOUSE_OVERFLOW_X  equ 0x40
+MOUSE_OVERFLOW_Y  equ 0x80
+MOUSE_BTN_LEFT    equ 0x01
+MOUSE_BTN_RIGHT   equ 0x02
+MOUSE_SCROLL_THRESHOLD equ 24
+MOUSE_CMD_SET_SAMPLE_RATE equ 0xF3
+MOUSE_CMD_GET_DEVICE_ID   equ 0xF2
 
 HIST_ROWS equ 200
 KBD_EXTENDED_PREFIX equ 0xE0
@@ -154,6 +173,8 @@ long_mode_start:
     call setup_idt
     call remap_pic
     call enable_kbd_irq
+    call enable_mouse_port
+    call mouse_detect_wheel
     call setup_pit
 
     mov al, 0x0D
@@ -176,6 +197,10 @@ setup_idt:
 
     mov rax, keyboard_isr
     mov rdi, IDT_ADDR + (IRQ1_VECTOR * 16)
+    call write_idt_entry
+
+    mov rax, mouse_isr
+    mov rdi, IDT_ADDR + (IRQ12_VECTOR * 16)
     call write_idt_entry
 
     lidt [idt_descriptor]
@@ -299,6 +324,85 @@ kbd_wait_output:
     in al, KBD_CMD_PORT
     test al, KBD_STATUS_OUTPUT_FULL
     jz kbd_wait_output
+    ret
+
+; --- Enable the 8042 aux (mouse) port and its IRQ12 line. Data reporting
+; is left off (the mouse default) until the "cursor on" command sends
+; MOUSE_CMD_ENABLE_REPORTING, so nothing streams unless opted into. ---
+enable_mouse_port:
+    call kbd_wait_input
+    mov al, PS2_CMD_ENABLE_AUX
+    out KBD_CMD_PORT, al
+
+    call kbd_wait_input
+    mov al, KBD_CMD_READ_CFG
+    out KBD_CMD_PORT, al
+    call kbd_wait_output
+    in al, KBD_DATA_PORT
+    or al, KBD_IRQ12_ENABLE_BIT
+    mov bl, al
+
+    call kbd_wait_input
+    mov al, KBD_CMD_WRITE_CFG
+    out KBD_CMD_PORT, al
+    call kbd_wait_input
+    mov al, bl
+    out KBD_DATA_PORT, al
+    ret
+
+; --- Send a command byte (in AL) to the mouse via the 0xD4 aux-port prefix ---
+mouse_write_cmd:
+    push rax
+    mov ah, al                  ; stash the command byte before kbd_wait_input clobbers al
+    call kbd_wait_input
+    mov al, PS2_CMD_WRITE_AUX
+    out KBD_CMD_PORT, al
+    call kbd_wait_input
+    mov al, ah
+    out KBD_DATA_PORT, al
+    pop rax
+    ret
+
+; --- Send AL to the mouse and drain its single-byte ACK (0xFA) response.
+; Only safe to call before `sti` (or with IRQ12 masked) - otherwise the ACK
+; byte races the interrupt handler's own packet framing. ---
+mouse_send_and_ack:
+    call mouse_write_cmd
+    call kbd_wait_output
+    in al, KBD_DATA_PORT
+    ret
+
+; --- IntelliMouse wheel detection: the "magic knock" (sample rate set to
+; 200, 100, then 80) tells a wheel mouse to switch to 4-byte packets; a
+; plain mouse just ignores it. Reading back the device ID afterward (3 =
+; wheel mouse) confirms whether it took. Called once at boot before `sti`. ---
+mouse_detect_wheel:
+    push rax
+
+    mov al, MOUSE_CMD_SET_SAMPLE_RATE
+    call mouse_send_and_ack
+    mov al, 200
+    call mouse_send_and_ack
+    mov al, MOUSE_CMD_SET_SAMPLE_RATE
+    call mouse_send_and_ack
+    mov al, 100
+    call mouse_send_and_ack
+    mov al, MOUSE_CMD_SET_SAMPLE_RATE
+    call mouse_send_and_ack
+    mov al, 80
+    call mouse_send_and_ack
+
+    mov al, MOUSE_CMD_GET_DEVICE_ID
+    call mouse_send_and_ack
+    call kbd_wait_output
+    in al, KBD_DATA_PORT
+    cmp al, 3
+    jne .no_wheel
+    mov byte [mouse_has_wheel], 1
+    mov byte [mouse_packet_size], 4
+.no_wheel:
+
+    pop rax
     ret
 
 ; --- IRQ1 handler: read scancode, translate, echo, buffer, run on Enter ---
@@ -2632,6 +2736,7 @@ command_table:
     dq sysinfo_cmd, sysinfo_cmd_end - sysinfo_cmd, cmd_sysinfo
     dq date_cmd, date_cmd_end - date_cmd, cmd_date
     dq time_cmd, time_cmd_end - time_cmd, cmd_time
+    dq cursor_cmd, cursor_cmd_end - cursor_cmd, cmd_cursor_toggle
     dq 0
 
 command_descriptions:
@@ -2652,6 +2757,7 @@ command_descriptions:
     dq desc_sysinfo,  desc_sysinfo_end - desc_sysinfo
     dq desc_date,     desc_date_end - desc_date
     dq desc_time,     desc_time_end - desc_time
+    dq desc_cursor,   desc_cursor_end - desc_cursor
 
 desc_echo db "print the given text"
 desc_echo_end:
@@ -2687,10 +2793,15 @@ desc_date db "show the current date"
 desc_date_end:
 desc_time db "show the current time"
 desc_time_end:
+desc_cursor db "experimental: toggle the PS/2 mouse cell cursor: cursor <on|off>"
+desc_cursor_end:
 
 help_sep db " - ", 0
 color_usage_msg db "Usage: color <red|green|blue|yellow|white|HH>", 0
 sysinfo_usage_msg db "Usage: sysinfo <cpu|ram|gpu|general>", 0
+cursor_usage_msg db "Usage: cursor <on|off>", 0
+cursor_on_msg db "Cursor on (experimental).", 0
+cursor_off_msg db "Cursor off.", 0
 
 ; --- Print a null-terminated string starting at RSI ---
 print_string:
@@ -2829,6 +2940,8 @@ scroll_screen:
     push rdi
     push rcx
 
+    call cursor_erase_highlight    ; don't bake the highlight into history
+
     ; save row 0 (about to scroll off) into history[hist_write % HIST_ROWS]
     movzx rax, word [hist_write]
     xor rdx, rdx
@@ -2862,6 +2975,8 @@ scroll_screen:
     mov [rdi + 1], dl
     add rdi, 2
     loop .clear_loop2
+
+    call cursor_refresh_if_enabled
 
     pop rcx
     pop rdi
@@ -2983,11 +3098,13 @@ scroll_view_up:
     jae .done
     cmp word [scroll_offset], 0
     jne .not_first
+    call cursor_erase_highlight    ; don't bake the highlight into live_shadow
     call save_live_shadow
     call hide_cursor
 .not_first:
     inc word [scroll_offset]
     call repaint_scrolled_view
+    call cursor_refresh_if_enabled
 
 .done:
     pop rax
@@ -3002,9 +3119,11 @@ scroll_view_down:
     jne .repaint
     call restore_live_shadow
     call show_cursor
+    call cursor_refresh_if_enabled
     jmp .done
 .repaint:
     call repaint_scrolled_view
+    call cursor_refresh_if_enabled
 .done:
     ret
 
@@ -3045,7 +3164,297 @@ snap_scroll_to_live:
     mov word [scroll_offset], 0
     call restore_live_shadow
     call show_cursor
+    call cursor_refresh_if_enabled
 .done:
+    ret
+
+; --- Re-draw the mouse cursor highlight over freshly repainted content, if
+; the experimental cursor is currently enabled. ---
+cursor_refresh_if_enabled:
+    cmp byte [cursor_enabled], 0
+    je .done
+    call cursor_draw_highlight
+.done:
+    ret
+
+; --- Experimental mouse-driven cell cursor: a highlighted cell (VGA_ATTR_SEL)
+; at (mouse_x, mouse_y), moved by IRQ12 PS/2 packets while `cursor on`. ---
+
+; --- Highlight the cell at (mouse_x, mouse_y), saving its current attribute
+; so it can be restored later. No-op if a cell is already highlighted (call
+; cursor_erase_highlight first if moving it). ---
+cursor_draw_highlight:
+    push rax
+    push rcx
+    push rdx
+    push rdi
+
+    movzx rax, byte [mouse_y]
+    mov rcx, VGA_ROW_BYTES
+    mul rcx
+    movzx rcx, byte [mouse_x]
+    shl rcx, 1
+    add rax, rcx
+    lea rdi, [VGA_MEM + rax]
+
+    mov al, [rdi + 1]
+    mov [cursor_cell_saved_attr], al
+    mov byte [rdi + 1], VGA_ATTR_SEL
+    mov byte [cursor_cell_valid], 1
+
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; --- Restore the attribute under the highlighted cell, if any. ---
+cursor_erase_highlight:
+    cmp byte [cursor_cell_valid], 0
+    je .done
+    push rax
+    push rcx
+    push rdx
+    push rdi
+
+    movzx rax, byte [mouse_y]
+    mov rcx, VGA_ROW_BYTES
+    mul rcx
+    movzx rcx, byte [mouse_x]
+    shl rcx, 1
+    add rax, rcx
+    lea rdi, [VGA_MEM + rax]
+
+    mov al, [cursor_cell_saved_attr]
+    mov [rdi + 1], al
+    mov byte [cursor_cell_valid], 0
+
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rax
+.done:
+    ret
+
+; --- IRQ12 handler: accumulate a 3-byte PS/2 mouse packet, then either move
+; the highlighted cursor cell (button state without the right button held)
+; or, while the right button is held, use vertical movement to drive
+; scroll_view_up/scroll_view_down (no scroll wheel on a plain PS/2 mouse). ---
+mouse_isr:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+
+    in al, KBD_DATA_PORT
+    movzx rbx, byte [mouse_packet_idx]
+    cmp bl, 0
+    jne .not_first_byte
+    test al, MOUSE_ALWAYS1_BIT
+    jz .eoi                        ; resync: drop a stray byte, don't advance
+.not_first_byte:
+    mov [mouse_packet + rbx], al
+    inc bl
+    mov [mouse_packet_idx], bl
+    movzx rcx, byte [mouse_packet_size]
+    cmp rbx, rcx
+    jb .eoi
+
+    mov byte [mouse_packet_idx], 0
+    cmp byte [cursor_enabled], 0
+    je .eoi
+
+    mov bl, [mouse_packet]          ; byte0: buttons + sign/overflow bits
+    test bl, MOUSE_OVERFLOW_X
+    jnz .eoi
+    test bl, MOUSE_OVERFLOW_Y
+    jnz .eoi
+
+    ; --- scroll wheel (IntelliMouse 4th byte): signed, +down/-up, independent
+    ; of button state ---
+    cmp byte [mouse_has_wheel], 0
+    je .no_wheel
+    movsx rax, byte [mouse_packet + 3]
+    or rax, rax
+    jz .no_wheel
+    jg .wheel_down
+    call scroll_view_up
+    jmp .no_wheel
+.wheel_down:
+    call scroll_view_down
+.no_wheel:
+    mov bl, [mouse_packet]          ; reload: scroll_view_* may have clobbered rbx
+
+    ; --- left-click edge: place the input caret under the cursor cell ---
+    test bl, MOUSE_BTN_LEFT
+    jz .no_left_edge
+    test byte [mouse_prev_buttons], MOUSE_BTN_LEFT
+    jnz .no_left_edge
+    push rbx
+    call mouse_try_place_caret
+    pop rbx
+.no_left_edge:
+    mov [mouse_prev_buttons], bl
+
+    movzx rax, byte [mouse_packet + 1]   ; dx, 9-bit two's complement
+    test bl, MOUSE_SIGN_X
+    jz .dx_ready
+    sub rax, 256
+.dx_ready:
+    movzx rdx, byte [mouse_packet + 2]   ; dy, positive = moved up
+    test bl, MOUSE_SIGN_Y
+    jz .dy_ready
+    sub rdx, 256
+.dy_ready:
+
+    test bl, MOUSE_BTN_RIGHT
+    jnz .scroll_drag
+
+    mov word [mouse_scroll_accum], 0
+    call cursor_erase_highlight     ; erase at the OLD position before it moves
+
+    mov rcx, rax
+    sar rcx, 2                     ; scale pixel-ish deltas down to cell steps
+    movzx rax, byte [mouse_x]
+    add rax, rcx
+    cmp rax, 0
+    jge .x_not_neg
+    xor rax, rax
+.x_not_neg:
+    cmp rax, VGA_COLS - 1
+    jle .x_not_over
+    mov rax, VGA_COLS - 1
+.x_not_over:
+    mov [mouse_x], al
+
+    mov rcx, rdx
+    sar rcx, 2
+    movzx rax, byte [mouse_y]
+    sub rax, rcx                   ; dy positive (up) moves row toward 0
+    cmp rax, 0
+    jge .y_not_neg
+    xor rax, rax
+.y_not_neg:
+    cmp rax, VGA_ROWS - 1
+    jle .y_not_over
+    mov rax, VGA_ROWS - 1
+.y_not_over:
+    mov [mouse_y], al
+
+    call cursor_draw_highlight
+    jmp .eoi
+
+.scroll_drag:
+    movsx rcx, word [mouse_scroll_accum]
+    add rcx, rdx
+    cmp rcx, MOUSE_SCROLL_THRESHOLD
+    jl .check_neg
+    call scroll_view_up
+    sub rcx, MOUSE_SCROLL_THRESHOLD
+    jmp .store_accum
+.check_neg:
+    cmp rcx, -MOUSE_SCROLL_THRESHOLD
+    jg .store_accum
+    call scroll_view_down
+    add rcx, MOUSE_SCROLL_THRESHOLD
+.store_accum:
+    mov [mouse_scroll_accum], cx
+
+.eoi:
+    mov al, PIC_EOI
+    out PIC2_CMD, al                ; EOI slave first, then master (cascaded IRQ)
+    out PIC1_CMD, al
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    iretq
+
+; place the input-line text-edit caret at the mouse-highlighted cell,
+; if (and only if) that cell is on the current prompt's row
+mouse_try_place_caret:
+    push rax
+    push rcx
+    push rdx
+
+    cmp word [scroll_offset], 0
+    jne .done
+
+    mov rax, [line_start_pos]
+    shr rax, 1                     ; byte offset -> character cell index
+
+    movzx rcx, byte [mouse_y]
+    imul rcx, VGA_COLS
+    movzx rdx, byte [mouse_x]
+    add rcx, rdx
+    sub rcx, rax
+
+    cmp rcx, 0
+    jl .done
+    movzx rdx, byte [cmd_len]
+    cmp rcx, rdx
+    jg .done
+
+    mov [cmd_cursor], cl
+    mov byte [sel_active], 0
+    call redraw_input_line
+
+.done:
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; --- "cursor" handler: toggle the experimental mouse-driven cell cursor ---
+cmd_cursor_toggle:
+    call skip_spaces
+    cmp byte [rsi], 'o'
+    jne .usage
+    cmp byte [rsi + 1], 'n'
+    jne .maybe_off
+    cmp byte [rsi + 2], 0
+    jne .usage
+
+    call cursor_erase_highlight
+    mov byte [mouse_x], VGA_COLS / 2
+    mov byte [mouse_y], VGA_ROWS / 2
+    mov byte [cursor_enabled], 1
+    mov al, MOUSE_CMD_ENABLE_REPORTING
+    call mouse_write_cmd
+    call cursor_draw_highlight
+    mov rsi, cursor_on_msg
+    call print_string
+    mov al, ASCII_CR
+    call print_char
+    ret
+
+.maybe_off:
+    cmp byte [rsi + 1], 'f'
+    jne .usage
+    cmp byte [rsi + 2], 'f'
+    jne .usage
+    cmp byte [rsi + 3], 0
+    jne .usage
+
+    mov byte [cursor_enabled], 0
+    mov al, MOUSE_CMD_DISABLE_REPORTING
+    call mouse_write_cmd
+    call cursor_erase_highlight
+    mov rsi, cursor_off_msg
+    call print_string
+    mov al, ASCII_CR
+    call print_char
+    ret
+
+.usage:
+    mov rsi, cursor_usage_msg
+    call print_string
+    mov al, ASCII_CR
+    call print_char
     ret
 
 msg db "Hello, Amethyst!", 0
@@ -3084,6 +3493,8 @@ date_cmd db "date"
 date_cmd_end:
 time_cmd db "time"
 time_cmd_end:
+cursor_cmd db "cursor"
+cursor_cmd_end:
 unknown_msg db "Unknown command: ", 0
 run_bad_hex_msg db "Invalid hex byte", 0
 run_too_long_msg db "Too many bytes for exec_buffer", 0
@@ -3209,6 +3620,19 @@ hist_write dw 0
 hist_count dw 0
 history_buffer times HIST_ROWS * VGA_ROW_BYTES db 0
 live_shadow times VGA_SIZE db 0
+
+; Experimental mouse cursor state (see `cursor` command / mouse_isr)
+cursor_enabled db 0
+mouse_x db 0
+mouse_y db 0
+mouse_packet times 4 db 0
+mouse_packet_idx db 0
+mouse_packet_size db 3
+mouse_has_wheel db 0
+mouse_prev_buttons db 0
+mouse_scroll_accum dw 0
+cursor_cell_valid db 0
+cursor_cell_saved_attr db 0
 
 ; US QWERTY set-1 scancode -> lowercase ASCII (0 = unmapped/ignored)
 scancode_table:
