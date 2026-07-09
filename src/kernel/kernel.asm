@@ -2666,6 +2666,41 @@ cmd_time:
     call print_char
     ret
 
+; --- "draw [gem|cat|amethyst_text]" handler: prints a fun ASCII drawing ---
+cmd_draw:
+    call skip_spaces
+    mov al, [rsi]
+    or al, al
+    jz .default
+
+    mov rdi, draw_gem_str
+    call sysinfo_arg_match
+    jc .do_gem
+    mov rdi, draw_cat_str
+    call sysinfo_arg_match
+    jc .do_cat
+    mov rdi, draw_logo_str
+    call sysinfo_arg_match
+    jc .do_logo
+
+    mov rsi, draw_usage_msg
+    call print_string
+    ret
+
+.default:
+.do_gem:
+    mov rsi, draw_art_gem
+    call print_string
+    ret
+.do_cat:
+    mov rsi, draw_art_cat
+    call print_string
+    ret
+.do_logo:
+    mov rsi, draw_art_logo
+    call print_string
+    ret
+
 ; --- Read CMOS RTC register AL, converting from BCD if needed. Returns
 ; the binary value in AL. ---
 rtc_get:
@@ -2737,6 +2772,7 @@ command_table:
     dq date_cmd, date_cmd_end - date_cmd, cmd_date
     dq time_cmd, time_cmd_end - time_cmd, cmd_time
     dq cursor_cmd, cursor_cmd_end - cursor_cmd, cmd_cursor_toggle
+    dq draw_cmd, draw_cmd_end - draw_cmd, cmd_draw
     dq 0
 
 command_descriptions:
@@ -2758,6 +2794,7 @@ command_descriptions:
     dq desc_date,     desc_date_end - desc_date
     dq desc_time,     desc_time_end - desc_time
     dq desc_cursor,   desc_cursor_end - desc_cursor
+    dq desc_draw,     desc_draw_end - desc_draw
 
 desc_echo db "print the given text"
 desc_echo_end:
@@ -2795,6 +2832,8 @@ desc_time db "show the current time"
 desc_time_end:
 desc_cursor db "experimental: toggle the PS/2 mouse cell cursor: cursor <on|off>"
 desc_cursor_end:
+desc_draw db "show a fun ASCII drawing: draw [gem|cat|amethyst_text]"
+desc_draw_end:
 
 help_sep db " - ", 0
 color_usage_msg db "Usage: color <red|green|blue|yellow|white|HH>", 0
@@ -2802,6 +2841,30 @@ sysinfo_usage_msg db "Usage: sysinfo <cpu|ram|gpu|general>", 0
 cursor_usage_msg db "Usage: cursor <on|off>", 0
 cursor_on_msg db "Cursor on (experimental).", 0
 cursor_off_msg db "Cursor off.", 0
+
+draw_usage_msg db "Usage: draw <gem|cat|amethyst_text>", 0
+draw_gem_str db "gem", 0
+draw_cat_str db "cat", 0
+draw_logo_str db "amethyst_text", 0
+
+draw_art_gem db "    /\  ", ASCII_CR
+             db "   /  \ ", ASCII_CR
+             db "  / /\ \", ASCII_CR
+             db " /_/  \_\", ASCII_CR
+             db " \ \  / /", ASCII_CR
+             db "  \ \/ / ", ASCII_CR
+             db "   \  /  ", ASCII_CR
+             db "    \/   Amethyst", ASCII_CR, 0
+
+draw_art_cat db " /\_/\ ", ASCII_CR
+             db "( o.o )", ASCII_CR
+             db " > ^ < ", ASCII_CR, 0
+
+draw_art_logo db "   _              _   _               _   ", ASCII_CR
+              db "  /_\  _ __  ___ | |_| |__ _  _ ___ _| |_ ", ASCII_CR
+              db " / _ \| '  \/ -_)|  _| '_ \ || (_-<  _  |", ASCII_CR
+              db "/_/ \_\_|_|_\___| \__|_.__/\_, /__/\____|", ASCII_CR
+              db "                           |__/           ", ASCII_CR, 0
 
 ; --- Print a null-terminated string starting at RSI ---
 print_string:
@@ -3493,6 +3556,8 @@ date_cmd db "date"
 date_cmd_end:
 time_cmd db "time"
 time_cmd_end:
+draw_cmd db "draw"
+draw_cmd_end:
 cursor_cmd db "cursor"
 cursor_cmd_end:
 unknown_msg db "Unknown command: ", 0
