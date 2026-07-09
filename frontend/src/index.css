@@ -1,0 +1,64 @@
+@font-face {
+  font-family: 'Perfect DOS VGA 437';
+  src: url('https://cdn.jsdelivr.net/gh/spartrekus/8bits-fonts@master/Perfect%20DOS%20VGA%20437.ttf') format('truetype');
+  font-display: swap;
+}
+
+:root {
+  --font-vga: 'Perfect DOS VGA 437', ui-monospace, monospace;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background-color: #000000;
+  color: #aaaaaa;
+  font-family: var(--font-vga);
+  overflow: hidden;
+  width: 100vw;
+  height: 100vh;
+}
+
+#root {
+  width: 100%;
+  height: 100%;
+}
+
+/* VGA Color Palette classes */
+.fg-0 { color: #000000; }
+.fg-1 { color: #0000aa; }
+.fg-2 { color: #00aa00; }
+.fg-3 { color: #00aaaa; }
+.fg-4 { color: #aa0000; }
+.fg-5 { color: #aa00aa; }
+.fg-6 { color: #aa5500; }
+.fg-7 { color: #aaaaaa; }
+.fg-8 { color: #555555; }
+.fg-9 { color: #5555ff; }
+.fg-10 { color: #55ff55; }
+.fg-11 { color: #55ffff; }
+.fg-12 { color: #ff5555; }
+.fg-13 { color: #ff55ff; }
+.fg-14 { color: #ffff55; }
+.fg-15 { color: #ffffff; }
+
+.bg-0 { background-color: #000000; }
+.bg-1 { background-color: #0000aa; }
+.bg-2 { background-color: #00aa00; }
+.bg-3 { background-color: #00aaaa; }
+.bg-4 { background-color: #aa0000; }
+.bg-5 { background-color: #aa00aa; }
+.bg-6 { background-color: #aa5500; }
+.bg-7 { background-color: #aaaaaa; }
+.bg-8 { background-color: #555555; }
+.bg-9 { background-color: #5555ff; }
+.bg-10 { background-color: #55ff55; }
+.bg-11 { background-color: #55ffff; }
+.bg-12 { background-color: #ff5555; }
+.bg-13 { background-color: #ff55ff; }
+.bg-14 { background-color: #ffff55; }
+.bg-15 { background-color: #ffffff; }

@@ -1,0 +1,77 @@
+/* App.css - Pure terminal window aligned to top-left with 10px padding */
+
+.terminal-container {
+  display: flex;
+  justify-content: flex-start;
+  align-items: flex-start;
+  width: 100vw;
+  height: 100vh;
+  background-color: #000000;
+  outline: none;
+  cursor: default; /* No text cursor */
+  box-sizing: border-box;
+  padding: 10px; /* 10px padding on all sides */
+  overflow: hidden;
+  user-select: none; /* Disable text selecting completely */
+  -webkit-user-select: none;
+  -moz-user-select: none;
+  -ms-user-select: none;
+}
+
+.terminal-screen {
+  font-family: var(--font-vga), 'Courier New', Courier, monospace;
+  /* Perfect scaling: 25 rows fill the screen height minus 20px padding */
+  font-size: calc((100vh - 20px) / 25); 
+  line-height: calc((100vh - 20px) / 25);
+  width: calc(80 * (100vh - 20px) * 0.5 / 25); /* Approximate aspect ratio of VGA font */
+  height: calc(100vh - 20px); /* Exact height to prevent bottom gap */
+  background-color: #000000;
+  color: #aaaaaa; /* Default VGA Light Gray */
+  box-sizing: border-box;
+  white-space: pre;
+  display: flex;
+  flex-direction: column;
+  /* Prevent anti-aliasing to make pixel font crisp */
+  -webkit-font-smoothing: none;
+  -moz-osx-font-smoothing: none;
+  font-smooth: never;
+  text-rendering: optimizeSpeed;
+}
+
+.crt-row {
+  display: flex;
+  flex-direction: row;
+  height: calc((100vh - 20px) / 25); /* Exact match for font height */
+  overflow: hidden;
+  margin: 0;
+  padding: 0;
+}
+
+.crt-row span {
+  display: inline-block;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  position: relative;
+}
+
+.vga-cursor::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0px;
+  height: calc((100vh - 20px) / 250); /* Proportional underline cursor */
+  min-height: 2px;
+  background-color: currentColor;
+  animation: vga-blink 1.0s step-end infinite;
+}
+
+@keyframes vga-blink {
+  0%, 49% {
+    opacity: 1;
+  }
+  50%, 100% {
+    opacity: 0;
+  }
+}

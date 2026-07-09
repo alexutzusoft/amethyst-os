@@ -1,5 +1,9 @@
 build/
 
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
 # AI Agents
 CLAUDE.md
 KLAT.md
