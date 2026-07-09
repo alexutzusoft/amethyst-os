@@ -1,0 +1,90 @@
+name: Build and Publish Release
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch: # Allows manual trigger from the Actions tab
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Required to create releases and push tags
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Fetch all history to extract the list of commits
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm mtools xorriso gcc-mingw-w64-x86-64
+
+      - name: Build and Release Each Commit
+        env:
+          GH_TOKEN: ${{ github.token }} # Authenticates the GitHub CLI (gh)
+        run: |
+          BEFORE="${{ github.event.before }}"
+          AFTER="${{ github.event.after }}"
+          
+          COMMITS=()
+          if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            # Attempt to list commits. If BEFORE doesn't exist (e.g. due to force push), this fails silently.
+            COMMITS=($(git rev-list --reverse "$BEFORE..$AFTER" 2>/dev/null || true))
+          fi
+          
+          # Fallback to the latest commit if the list is empty (first push, manual run, or force-push)
+          if [ ${#COMMITS[@]} -eq 0 ]; then
+            COMMITS=($AFTER)
+          fi
+          
+          echo "Found ${#COMMITS[@]} commit(s) to process."
+          
+          for COMMIT in "${COMMITS[@]}"; do
+            echo "----------------------------------------"
+            echo "Processing commit: $COMMIT"
+            git checkout "$COMMIT"
+            
+            # Get the short SHA for the commit
+            SHORT_SHA=$(git rev-parse --short "$COMMIT")
+            TAG="nightly-$SHORT_SHA"
+            TITLE="Nightly [$SHORT_SHA]"
+            
+            echo "Building images for tag: $TAG"
+            chmod +x tools/build.sh
+            ./tools/build.sh
+            
+            # Calculate SHA256 checksums of the output files
+            ISO_SHA256=$(sha256sum build/amethyst-os.iso | awk '{print $1}')
+            IMG_SHA256=$(sha256sum build/amethyst-os.img | awk '{print $1}')
+            
+            echo "Publishing release: $TAG"
+            
+            # Generate release notes matching your template
+            echo "This release has been built by Github Actions" > release_notes.txt
+            echo "[Link to build](https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)" >> release_notes.txt
+            echo "" >> release_notes.txt
+            echo "Build SHA256:" >> release_notes.txt
+            echo "\`$ISO_SHA256\` amethyst-os.iso" >> release_notes.txt
+            echo "\`$IMG_SHA256\` amethyst-os.img" >> release_notes.txt
+            echo "" >> release_notes.txt
+            echo "### Commit Message:" >> release_notes.txt
+            
+            # Append the actual commit message safely
+            git log -1 --format=%B "$COMMIT" >> release_notes.txt
+            
+            # Append full commit hash
+            echo "" >> release_notes.txt
+            echo "Full Commit Hash:" >> release_notes.txt
+            echo "\`$COMMIT\`" >> release_notes.txt
+            
+            # gh release create automatically tags the target commit on remote
+            gh release create "$TAG" build/amethyst-os.iso build/amethyst-os.img \
+              --target "$COMMIT" \
+              --title "$TITLE" \
+              --notes-file release_notes.txt \
+              --prerelease
+          done

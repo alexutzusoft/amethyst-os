@@ -16,8 +16,8 @@ tools/build.sh
 tools/run.sh
 ```
 
-`build.sh` produces `build/AmethystOS.iso` (hybrid BIOS+UEFI, for
-`-cdrom`/optical boot) and `build/AmethystOS.img` (raw disk image for
+`build.sh` produces `build/amethyst-os.iso` (hybrid BIOS+UEFI, for
+`-cdrom`/optical boot) and `build/amethyst-os.img` (raw disk image for
 `dd`/Rufus-style USB writing).
 
 Other run scripts:

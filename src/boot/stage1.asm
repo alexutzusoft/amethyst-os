@@ -5,7 +5,7 @@
 ;  - El Torito "no emulation" CD boot: BIOS loads the whole stage1+kernel
 ;    blob (KERNEL_SECTORS sectors, see tools/build.sh -boot-load-size) in
 ;    one shot at 0x7C00 before jumping here - no disk I/O needed.
-;  - Raw HDD/USB boot (build/AmethystOS.img, written LBA 0 = this file's
+;  - Raw HDD/USB boot (build/amethyst-os.img, written LBA 0 = this file's
 ;    first sector): BIOS only loads this one 512-byte sector at 0x7C00.
 ;    The boot sector below is therefore also a valid MBR (partition table
 ;    + 0x55AA signature at the standard offsets) and loads the rest of
@@ -126,7 +126,7 @@ dap:
 
 ; --- MBR partition table + boot signature, at the standard fixed offsets.
 ; Only used/read for the raw-disk boot path (Rufus/dd write of
-; build/AmethystOS.img) so tools like fdisk show a sane bootable layout;
+; build/amethyst-os.img) so tools like fdisk show a sane bootable layout;
 ; the boot code above jumps here unconditionally regardless of contents,
 ; so this table isn't load-bearing for booting itself. ---
 times 446 - ($ - $$) db 0

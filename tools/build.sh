@@ -38,22 +38,22 @@ cp build/BOOTX64.EFI build/iso/EFI/BOOT/BOOTX64.EFI
 # disc. (We previously tried xorriso -isohybrid-mbr to also make this same
 # .iso raw-USB-bootable, but that patches in ISOLINUX's own hybrid MBR,
 # which looks for a file literally named isolinux.bin and fails outright
-# against our own boot.bin - see build/AmethystOS.img below instead.) ---
-xorriso -as mkisofs -o build/AmethystOS.iso \
+# against our own boot.bin - see build/amethyst-os.img below instead.) ---
+xorriso -as mkisofs -o build/amethyst-os.iso \
     -b boot.bin -no-emul-boot -boot-load-size 128 \
     -eltorito-alt-boot \
     -e esp.img -no-emul-boot \
     build/iso
 
-echo "Built build/AmethystOS.iso"
+echo "Built build/amethyst-os.iso"
 
 # --- Raw disk image for USB (Rufus DD mode / dd): our own MBR (boot.bin's
 # first sector, see stage1.asm) placed directly at LBA 0 so BIOS finds it
 # on a raw read, followed by the 1MiB-aligned ESP partition for UEFI raw-
 # disk boot. Built from scratch (not reusing the ISO9660 layout above)
 # since boot.bin needs to physically BE sector 0 of the medium. ---
-cp build/boot.bin build/AmethystOS.img
-truncate -s 1M build/AmethystOS.img
-cat build/iso/esp.img >> build/AmethystOS.img
+cp build/boot.bin build/amethyst-os.img
+truncate -s 1M build/amethyst-os.img
+cat build/iso/esp.img >> build/amethyst-os.img
 
-echo "Built build/AmethystOS.img"
+echo "Built build/amethyst-os.img"
