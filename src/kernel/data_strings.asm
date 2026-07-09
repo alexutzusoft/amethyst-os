@@ -153,6 +153,13 @@ cmd_cursor db 0
 sel_active db 0
 sel_anchor db 0
 cmd_render_len db 0
+cmd_history times CMD_HISTORY_ENTRIES * CMD_BUFFER_SIZE db 0
+cmd_history_len times CMD_HISTORY_ENTRIES db 0
+cmd_history_write dw 0
+cmd_history_count dw 0
+cmd_history_pos dw 0
+cmd_history_saved times CMD_BUFFER_SIZE db 0
+cmd_history_saved_len db 0
 line_start_pos dq 0
 scroll_offset dw 0
 cursor_start_shape db 0

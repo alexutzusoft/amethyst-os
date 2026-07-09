@@ -116,12 +116,24 @@ keyboard_isr:
 .arrow_up:
     test bl, KBD_BREAK_BIT
     jnz .eoi
+    cmp byte [shift_state], 0
+    jne .arrow_up_scroll
+    call snap_scroll_to_live
+    call history_recall_prev
+    jmp .eoi
+.arrow_up_scroll:
     call scroll_view_up
     jmp .eoi
 
 .arrow_down:
     test bl, KBD_BREAK_BIT
     jnz .eoi
+    cmp byte [shift_state], 0
+    jne .arrow_down_scroll
+    call snap_scroll_to_live
+    call history_recall_next
+    jmp .eoi
+.arrow_down_scroll:
     call scroll_view_down
     jmp .eoi
 
@@ -169,11 +181,13 @@ keyboard_isr:
     movzx rcx, byte [cmd_len]
     mov byte [cmd_buffer + rcx], 0
     call print_char
+    call history_push
     call process_command
     mov byte [cmd_len], 0
     mov byte [cmd_cursor], 0
     mov byte [sel_active], 0
     mov byte [cmd_render_len], 0
+    mov word [cmd_history_pos], 0
     mov rsi, prompt
     call print_string
     mov rax, [cursor_pos]
@@ -448,6 +462,138 @@ redraw_input_line:
     call update_cursor
 
     pop rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; --- Append cmd_buffer (length cmd_len) to the command history ring buffer.
+; Called on Enter, before cmd_buffer is cleared. Skips empty lines. ---
+history_push:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+
+    cmp byte [cmd_len], 0
+    je .done
+
+    movzx rax, word [cmd_history_write]
+    mov rcx, CMD_BUFFER_SIZE
+    mul rcx
+    lea rdi, [cmd_history + rax]
+    mov rsi, cmd_buffer
+    movzx rcx, byte [cmd_len]
+    rep movsb
+
+    movzx rax, word [cmd_history_write]
+    movzx rdx, byte [cmd_len]
+    mov [cmd_history_len + rax], dl
+
+    inc word [cmd_history_write]
+    cmp word [cmd_history_write], CMD_HISTORY_ENTRIES
+    jne .no_wrap
+    mov word [cmd_history_write], 0
+.no_wrap:
+    cmp word [cmd_history_count], CMD_HISTORY_ENTRIES
+    jae .done
+    inc word [cmd_history_count]
+
+.done:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; --- Recall the previous (older) history entry into cmd_buffer, saving the
+; in-progress line first if this is the first Up press. ---
+history_recall_prev:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+
+    movzx rax, word [cmd_history_count]
+    cmp [cmd_history_pos], ax
+    jae .done
+
+    cmp word [cmd_history_pos], 0
+    jne .no_save
+    movzx rcx, byte [cmd_len]
+    mov rsi, cmd_buffer
+    mov rdi, cmd_history_saved
+    rep movsb
+    mov al, [cmd_len]
+    mov [cmd_history_saved_len], al
+.no_save:
+    inc word [cmd_history_pos]
+    call history_load_current
+
+.done:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; --- Recall the next (newer) history entry into cmd_buffer, or restore the
+; saved in-progress line once back at the live position. ---
+history_recall_next:
+    cmp word [cmd_history_pos], 0
+    je .done
+    dec word [cmd_history_pos]
+    call history_load_current
+.done:
+    ret
+
+; --- Load cmd_buffer from cmd_history_pos (0 = the saved in-progress line,
+; N>0 = the Nth most recent history entry), reset cursor/selection, redraw. ---
+history_load_current:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+
+    cmp word [cmd_history_pos], 0
+    jne .from_history
+    mov rsi, cmd_history_saved
+    movzx rcx, byte [cmd_history_saved_len]
+    jmp .have_source
+
+.from_history:
+    movzx rax, word [cmd_history_write]
+    movzx rbx, word [cmd_history_pos]
+    sub rax, rbx
+    add rax, CMD_HISTORY_ENTRIES
+    xor rdx, rdx
+    mov rcx, CMD_HISTORY_ENTRIES
+    div rcx                      ; rdx = history slot index
+    mov rax, rdx
+    movzx rcx, byte [cmd_history_len + rax]
+    mov rdx, CMD_BUFFER_SIZE
+    mul rdx                      ; rax = slot index * CMD_BUFFER_SIZE
+    lea rsi, [cmd_history + rax]
+
+.have_source:
+    mov rdi, cmd_buffer
+    push rcx
+    rep movsb
+    pop rcx
+    mov [cmd_len], cl
+    mov [cmd_cursor], cl
+    mov byte [sel_active], 0
+    call redraw_input_line
+
+    pop rdi
+    pop rsi
     pop rdx
     pop rcx
     pop rbx
