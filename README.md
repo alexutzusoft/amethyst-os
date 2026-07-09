@@ -5,11 +5,11 @@ from real mode through protected mode into 64-bit long mode with no
 bootloader dependencies beyond the code in this repo.
 
 Boots via legacy BIOS (MBR/El Torito) or UEFI, into a simple text-mode
-shell with commands like `help`, `echo`, `run`, `mem`, `peek`/`poke`,
-`cpuid`, `acpi`, `sysinfo`, `uptime`, `date`/`time`, `color`, `draw`, and
-`reboot`/`halt`/`shutdown`.
+shell with commands like `help`, `echo`, `clear`, `run`, `calc`, `mem`,
+`peek`/`poke`, `cpuid`, `acpi`, `sysinfo`, `uptime`, `date`/`time`, `color`,
+`cursor`, `draw`, and `reboot`/`halt`/`shutdown`.
 
-## Build & run (WSL)
+## Build & run (QEMU)
 
 ```
 tools/build.sh
