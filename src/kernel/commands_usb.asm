@@ -347,6 +347,90 @@ xhci_wait_event:
     stc
     ret
 
+; --- Fetch and print one USB string descriptor via a control transfer on
+; the already-addressed device in slot r10d (r12 = doorbell base, r13 =
+; runtime register base). al = string descriptor index (0 = none, skipped);
+; rdx = header message to print before the decoded UTF-16LE text. No-ops
+; silently on a zero index, timeout, or failure completion code. ---
+xhci_print_string_desc:
+    test al, al
+    jz .done
+    push rdx
+    mov ah, al
+    mov al, 0
+
+    movzx r9d, byte [xhci_xfer_cycle]
+    mov edi, XHCI_XFER_RING
+    mov byte [edi + 0], 0x80
+    mov byte [edi + 1], 0x06
+    mov al, ah
+    mov ah, 3
+    mov [edi + 2], ax
+    mov word [edi + 4], 0x0409
+    mov word [edi + 6], 255
+    mov dword [edi + 8], 8
+    mov dword [edi + 12], (2 << 10) | (3 << 16) | (1 << 6)       ; SETUP_STAGE, TRT=IN, IDT
+    or dword [edi + 12], r9d
+
+    add edi, 16
+    mov eax, XHCI_DATA_BUFFER
+    mov [edi + 0], eax
+    mov dword [edi + 4], 0
+    mov dword [edi + 8], 255
+    mov dword [edi + 12], (3 << 10) | (1 << 16)                  ; DATA_STAGE, DIR=IN
+    or dword [edi + 12], r9d
+
+    add edi, 16
+    mov dword [edi + 0], 0
+    mov dword [edi + 4], 0
+    mov dword [edi + 8], 0
+    mov dword [edi + 12], (4 << 10) | (1 << 5)                   ; STATUS_STAGE, IOC, DIR=OUT
+    or dword [edi + 12], r9d
+
+    add edi, 16
+    mov eax, XHCI_XFER_RING
+    mov [edi + 0], eax
+    mov dword [edi + 4], 0
+    mov dword [edi + 12], (6 << 10) | (1 << 1)                   ; LINK, TC=1
+    or dword [edi + 12], r9d
+    xor byte [xhci_xfer_cycle], 1
+
+    mov eax, r10d
+    shl eax, 2
+    mov rdi, r12
+    add edi, eax
+    mov dword [edi], 1                  ; ring EP0 doorbell (DCI 1)
+
+    mov dl, 32                           ; Transfer Event
+    call xhci_wait_event
+    pop rdx
+    jc .done
+    mov r11, rsi                         ; save TRB pointer
+    mov eax, [r11 + 8]
+    shr eax, 24
+    cmp eax, 1
+    jne .done
+
+    movzx ebx, byte [XHCI_DATA_BUFFER]   ; bLength
+    cmp ebx, 2
+    jbe .done
+    sub ebx, 2
+    shr ebx, 1                           ; rbx = char count
+    mov r9, XHCI_DATA_BUFFER + 2
+
+    mov rsi, rdx
+    call print_string
+.print_loop:
+    mov al, [r9]
+    call print_char
+    add r9, 2
+    dec ebx
+    jnz .print_loop
+    mov al, ASCII_CR
+    call print_char
+.done:
+    ret
+
 ; --- Reset and probe one xHCI controller for connected devices, fetching
 ; each device descriptor via a real Enable Slot / Address Device / control
 ; transfer sequence (reusing one slot serially across ports). rbp = xHCI
@@ -762,87 +846,16 @@ xhci_probe_controller:
     mov al, ASCII_CR
     call print_char
 
-    ; --- GET_DESCRIPTOR(String, iProduct), langid 0x0409 (English/US) ---
-    movzx eax, byte [XHCI_DATA_BUFFER + 15]   ; iProduct index
-    test eax, eax
-    jz .disable_slot
-    mov ah, al
-    mov al, 0
-
-    movzx r9d, byte [xhci_xfer_cycle]
-    mov edi, XHCI_XFER_RING
-    mov byte [edi + 0], 0x80
-    mov byte [edi + 1], 0x06
-    mov al, ah
-    mov ah, 3
-    mov [edi + 2], ax
-    mov word [edi + 4], 0x0409
-    mov word [edi + 6], 255
-    mov dword [edi + 8], 8
-    mov dword [edi + 12], (2 << 10) | (3 << 16) | (1 << 6)       ; SETUP_STAGE, TRT=IN, IDT
-    or dword [edi + 12], r9d
-
-    add edi, 16
-    mov eax, XHCI_DATA_BUFFER
-    mov [edi + 0], eax
-    mov dword [edi + 4], 0
-    mov dword [edi + 8], 255
-    mov dword [edi + 12], (3 << 10) | (1 << 16)                  ; DATA_STAGE, DIR=IN
-    or dword [edi + 12], r9d
-
-    add edi, 16
-    mov dword [edi + 0], 0
-    mov dword [edi + 4], 0
-    mov dword [edi + 8], 0
-    mov dword [edi + 12], (4 << 10) | (1 << 5)                   ; STATUS_STAGE, IOC, DIR=OUT
-    or dword [edi + 12], r9d
-
-    add edi, 16
-    mov eax, XHCI_XFER_RING
-    mov [edi + 0], eax
-    mov dword [edi + 4], 0
-    mov dword [edi + 12], (6 << 10) | (1 << 1)                   ; LINK, TC=1
-    or dword [edi + 12], r9d
-    xor byte [xhci_xfer_cycle], 1
-
-    mov eax, r10d
-    shl eax, 2
-    mov rdi, r12
-    add edi, eax
-    mov dword [edi], 1                  ; ring EP0 doorbell (DCI 1)
-
-    mov dl, 32                           ; Transfer Event
-    call xhci_wait_event
-    jnc .name_event_ok
-    mov rsi, xhci_dbg_timeout_msg
-    call print_string
-    mov al, ASCII_CR
-    call print_char
-    jmp .disable_slot
-.name_event_ok:
-    mov r11, rsi                         ; save TRB pointer
-    mov eax, [r11 + 8]
-    shr eax, 24
-    cmp eax, 1
-    jne .disable_slot
-
-    movzx ebx, byte [XHCI_DATA_BUFFER]   ; bLength
-    cmp ebx, 2
-    jbe .disable_slot
-    sub ebx, 2
-    shr ebx, 1                           ; rbx = char count
-    mov r9, XHCI_DATA_BUFFER + 2
-
-    mov rsi, usb_name_msg
-    call print_string
-.name_loop:
-    mov al, [r9]
-    call print_char
-    add r9, 2
-    dec ebx
-    jnz .name_loop
-    mov al, ASCII_CR
-    call print_char
+    ; --- GET_DESCRIPTOR(String, iManufacturer / iProduct), langid 0x0409 ---
+    movzx eax, byte [XHCI_DATA_BUFFER + 15]   ; stash iProduct index (buffer
+    push rax                                  ; gets overwritten by the
+                                               ; iManufacturer transfer below)
+    movzx eax, byte [XHCI_DATA_BUFFER + 14]   ; iManufacturer index
+    mov rdx, usb_vendor_name_msg
+    call xhci_print_string_desc
+    pop rax
+    mov rdx, usb_name_msg
+    call xhci_print_string_desc
 
 .disable_slot:
     mov eax, [xhci_cmd_index]

@@ -139,6 +139,7 @@ usb_type_xhci_msg db "xHCI (USB3.x)", 0
 usb_type_unknown_msg db "unknown", 0
 usb_dev_found_msg db "  device: class 0x", 0
 usb_name_msg db "  name: ", 0
+usb_vendor_name_msg db "  vendor: ", 0
 xhci_dbg_csz_msg db "  xhci: 64-byte contexts unsupported, skipping", 0
 xhci_dbg_reset_msg db "  xhci: reset/run timeout, skipping", 0
 xhci_dbg_scratch_msg db "  xhci: too many scratchpad buffers, skipping", 0
