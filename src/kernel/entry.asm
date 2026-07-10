@@ -8,27 +8,42 @@ protected_mode_start:
     mov ss, ax
     mov esp, 0x90000
 
-    ; zero the page-table pages and the IDT page (0x1000-0x4FFF)
+    ; zero the page-table pages (0x1000-0x4FFF) - leaves 0x5000 (BIOS mmap
+    ; capture) untouched, and the IDT page is zeroed separately below since
+    ; it isn't contiguous with these (see PML4_ADDR comment).
     mov edi, PML4_ADDR
     xor eax, eax
     mov ecx, 4 * 1024        ; 4 pages * 4096 bytes / 4 bytes per dword
     rep stosd
+    mov edi, IDT_ADDR
+    xor eax, eax
+    mov ecx, 1024
+    rep stosd
 
-    ; PML4[0] -> PDPT, PDPT[0] -> PD, PD[0..511] -> 512 identity 2MB pages (1GB).
-    ; The wider map (vs. a single 2MB page) is so peek/mem/poke and the
-    ; shutdown command's ACPI table scan can touch memory outside the first
-    ; 2MB without page-faulting (there's no page-fault handler installed).
+    ; PML4[0] -> PDPT. PDPT[0] -> PD0 (identity 2MB pages for 0-1GB).
+    ; PDPT[3] -> PD3 (identity 2MB pages for 3-4GB, the usual PCI MMIO hole).
+    ; PDPT[1]/[2] (1-3GB) stay not-present/unmapped.
     mov dword [PML4_ADDR], PDPT_ADDR | 0b11   ; present + writable
-    mov dword [PDPT_ADDR], PD_ADDR   | 0b11
+    mov dword [PDPT_ADDR],      PD0_ADDR | 0b11
+    mov dword [PDPT_ADDR + 24], PD3_ADDR | 0b11
 
-    mov edi, PD_ADDR
+    mov edi, PD0_ADDR
     mov eax, 0b10000011        ; present + writable + 2MB page, address 0
     mov ecx, 512
-.map_pd_loop:
+.map_pd0_loop:
     mov [edi], eax
     add eax, 0x200000
     add edi, 8
-    loop .map_pd_loop
+    loop .map_pd0_loop
+
+    mov edi, PD3_ADDR
+    mov eax, 0xC0000000 | 0b10000011   ; present + writable + 2MB page, address 3GB
+    mov ecx, 512
+.map_pd3_loop:
+    mov [edi], eax
+    add eax, 0x200000
+    add edi, 8
+    loop .map_pd3_loop
 
     mov eax, PML4_ADDR
     mov cr3, eax
@@ -48,7 +63,7 @@ protected_mode_start:
 
     jmp CODE64_SEG:long_mode_start
 
-IDT_ADDR equ 0x4000
+IDT_ADDR equ 0x6000   ; clear of the 0x5000-0x5607 BIOS mmap capture and 0x7C00 load addr
 
 [BITS 64]
 long_mode_start:

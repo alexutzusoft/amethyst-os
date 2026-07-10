@@ -40,6 +40,43 @@ IRQ12_VECTOR equ 0x2C
 ; triple-faults real hardware. ---
 IDENTITY_MAP_LIMIT equ 0x40000000
 
+; --- A second identity-mapped window at the top of the 32-bit address space
+; (see protected_mode_start's PD3 mapping) - this is the usual "PCI hole"
+; where firmware places 32-bit MMIO BARs (EHCI/xHCI controllers, etc.) on
+; real hardware. Anything outside [0, IDENTITY_MAP_LIMIT) and
+; [MMIO_HIGH_BASE, MMIO_HIGH_LIMIT) is not safely dereferenceable - there is
+; no page-fault handler installed. ---
+MMIO_HIGH_BASE  equ 0xC0000000
+MMIO_HIGH_LIMIT equ 0x100000000
+
+; --- Fixed low-memory scratch region for the EHCI/xHCI control-transfer
+; structures (QH/qTD rings, setup packet, descriptor buffer). 2MB mark:
+; comfortably clear of the ~64KB boot/kernel blob at 0x7C00 and the
+; 0x90000 real-mode-era stack. ---
+USB_SCRATCH_BASE  equ 0x200000
+USB_QH_ADDR       equ USB_SCRATCH_BASE + 0x000   ; 48 bytes
+USB_QTD_SETUP     equ USB_SCRATCH_BASE + 0x040   ; 32 bytes
+USB_QTD_IN        equ USB_SCRATCH_BASE + 0x060   ; 32 bytes
+USB_QTD_STATUS    equ USB_SCRATCH_BASE + 0x080   ; 32 bytes
+USB_SETUP_PACKET  equ USB_SCRATCH_BASE + 0x0A0   ; 8 bytes
+USB_DATA_BUFFER   equ USB_SCRATCH_BASE + 0x100   ; 18 bytes (device descriptor)
+
+; --- xHCI (USB3.x) scratch region. Each sub-region is page-aligned, which
+; satisfies every xHCI alignment requirement (64-byte contexts/rings, 16-byte
+; TRBs) with room to spare. Serves one device at a time - probing reuses slot
+; ID 1 and rebuilds the transfer ring fresh for each connected port. ---
+XHCI_SCRATCH_BASE  equ 0x300000
+XHCI_DCBAA         equ XHCI_SCRATCH_BASE + 0x0000  ; device context base addr array, up to 256 slots * 8B
+XHCI_INPUT_CTX     equ XHCI_SCRATCH_BASE + 0x1000  ; input control(32) + slot(32) + ep0(32) contexts
+XHCI_OUTPUT_CTX    equ XHCI_SCRATCH_BASE + 0x1100  ; slot(32) + ep0(32) contexts
+XHCI_CMD_RING      equ XHCI_SCRATCH_BASE + 0x2000  ; 64 TRBs * 16B
+XHCI_EVENT_RING    equ XHCI_SCRATCH_BASE + 0x3000  ; 16 TRBs * 16B
+XHCI_ERST          equ XHCI_SCRATCH_BASE + 0x4000  ; one 16-byte event ring segment table entry
+XHCI_XFER_RING     equ XHCI_SCRATCH_BASE + 0x5000  ; EP0 control transfer ring: setup/data/status/link TRBs
+XHCI_DATA_BUFFER   equ XHCI_SCRATCH_BASE + 0x6000  ; 18 bytes (device descriptor)
+XHCI_SCRATCH_ARRAY equ XHCI_SCRATCH_BASE + 0x7000  ; scratchpad buffer array, up to 64 pointers
+XHCI_SCRATCH_PAGES equ XHCI_SCRATCH_BASE + 0x8000  ; up to 64 * 4KB scratchpad buffer pages
+
 ; --- BIOS memory map captured by stage1.asm's detect_memory (real mode,
 ; before the switch to protected/long mode - BIOS interrupts aren't
 ; reachable from here). Keep these equs in sync with stage1.asm's copy. ---

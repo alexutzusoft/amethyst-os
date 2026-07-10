@@ -11,6 +11,7 @@
 %include "src/kernel/commands_sysinfo.asm"
 %include "src/kernel/commands_acpi.asm"
 %include "src/kernel/commands_misc.asm"
+%include "src/kernel/commands_usb.asm"
 %include "src/kernel/data_commands.asm"
 %include "src/kernel/display.asm"
 %include "src/kernel/data_strings.asm"

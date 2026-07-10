@@ -19,6 +19,7 @@ command_table:
     dq cursor_cmd, cursor_cmd_end - cursor_cmd, cmd_cursor_toggle
     dq draw_cmd, draw_cmd_end - draw_cmd, cmd_draw
     dq calc_cmd, calc_cmd_end - calc_cmd, cmd_calc
+    dq usb_cmd, usb_cmd_end - usb_cmd, cmd_usb
     dq 0
 
 command_descriptions:
@@ -42,6 +43,7 @@ command_descriptions:
     dq desc_cursor,   desc_cursor_end - desc_cursor
     dq desc_draw,     desc_draw_end - desc_draw
     dq desc_calc,     desc_calc_end - desc_calc
+    dq desc_usb,      desc_usb_end - desc_usb
 
 desc_echo db "print the given text"
 desc_echo_end:
@@ -83,6 +85,8 @@ desc_draw db "show a fun ASCII drawing: draw [gem|cat|amethyst_text]"
 desc_draw_end:
 desc_calc db "basic arithmetic: calc <a> <+|-|*|/|%|sqrt> [b]"
 desc_calc_end:
+desc_usb db "scan PCI for USB host controllers (UHCI/OHCI/EHCI/xHCI)"
+desc_usb_end:
 
 help_sep db " - ", 0
 color_usage_msg db "Usage: color <red|green|blue|yellow|white|HH>", 0
@@ -119,4 +123,24 @@ draw_art_logo db "   _              _   _               _   ", ASCII_CR
               db " / _ \| '  \/ -_)|  _| '_ \ || (_-<  _  |", ASCII_CR
               db "/_/ \_\_|_|_\___| \__|_.__/\_, /__/\____|", ASCII_CR
               db "                           |__/           ", ASCII_CR, 0
+
+usb_header_msg db "Scanning PCI for USB controllers...", 0
+usb_none_msg db "No USB controllers found.", 0
+usb_bus_msg db "bus ", 0
+usb_dev_msg db " dev ", 0
+usb_func_msg db " func ", 0
+usb_vendor_msg db " vendor 0x", 0
+usb_device_msg db " device 0x", 0
+usb_type_msg db " type ", 0
+usb_type_uhci_msg db "UHCI (USB1.1)", 0
+usb_type_ohci_msg db "OHCI (USB1.1)", 0
+usb_type_ehci_msg db "EHCI (USB2.0)", 0
+usb_type_xhci_msg db "xHCI (USB3.x)", 0
+usb_type_unknown_msg db "unknown", 0
+usb_dev_found_msg db "  device: class 0x", 0
+usb_name_msg db "  name: ", 0
+xhci_dbg_csz_msg db "  xhci: 64-byte contexts unsupported, skipping", 0
+xhci_dbg_reset_msg db "  xhci: reset/run timeout, skipping", 0
+xhci_dbg_scratch_msg db "  xhci: too many scratchpad buffers, skipping", 0
+xhci_dbg_timeout_msg db "  event wait timeout", 0
 

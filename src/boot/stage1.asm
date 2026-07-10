@@ -194,10 +194,17 @@ CODE32_SEG equ gdt_code32 - gdt_start
 DATA32_SEG equ gdt_data32 - gdt_start
 CODE64_SEG equ gdt_code64 - gdt_start
 
-; --- Page table locations (identity-mapped low memory scratch area) ---
+; --- Page table locations (identity-mapped low memory scratch area, all
+; below the 0x7C00 boot-sector/kernel load address). PD0 covers 0-1GB
+; (general RAM/ACPI use); PD3 covers the 3-4GB "PCI hole" where 32-bit MMIO
+; BARs (e.g. USB EHCI/xHCI controllers) commonly land on real hardware.
+; PDPT[1]/[2] (1-3GB) are deliberately left not-present to keep the fixed
+; low-memory table footprint below the 0x5000 BIOS memory-map capture (see
+; MMAP_COUNT_ADDR) and IDT_ADDR, all still under 0x7C00. ---
 PML4_ADDR equ 0x1000
 PDPT_ADDR equ 0x2000
-PD_ADDR   equ 0x3000
+PD0_ADDR  equ 0x3000
+PD3_ADDR  equ 0x4000
 
 %include "src/kernel/kernel.asm"
 

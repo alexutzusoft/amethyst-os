@@ -37,6 +37,8 @@ calc_cmd db "calc"
 calc_cmd_end:
 cursor_cmd db "cursor"
 cursor_cmd_end:
+usb_cmd db "usb"
+usb_cmd_end:
 unknown_msg db "Unknown command: ", 0
 run_bad_hex_msg db "Invalid hex byte", 0
 run_too_long_msg db "Too many bytes for exec_buffer", 0
@@ -128,6 +130,12 @@ null_idt_descriptor:
 
 cursor_pos dq 0
 text_attr db VGA_ATTR
+xhci_cmd_index dd 0
+xhci_evt_index dd 0
+xhci_evt_cycle db 1
+xhci_speed dd 0
+xhci_mps dd 0
+xhci_xfer_cycle db 1
 cmd_len db 0
 cmd_buffer times CMD_BUFFER_SIZE db 0
 timer_ticks dq 0
