@@ -20,6 +20,8 @@ command_table:
     dq draw_cmd, draw_cmd_end - draw_cmd, cmd_draw
     dq calc_cmd, calc_cmd_end - calc_cmd, cmd_calc
     dq usb_cmd, usb_cmd_end - usb_cmd, cmd_usb
+    dq ls_cmd, ls_cmd_end - ls_cmd, cmd_ls
+    dq dir_cmd, dir_cmd_end - dir_cmd, cmd_ls
     dq 0
 
 command_descriptions:
@@ -44,6 +46,8 @@ command_descriptions:
     dq desc_draw,     desc_draw_end - desc_draw
     dq desc_calc,     desc_calc_end - desc_calc
     dq desc_usb,      desc_usb_end - desc_usb
+    dq desc_ls,       desc_ls_end - desc_ls
+    dq desc_dir,      desc_dir_end - desc_dir
 
 desc_echo db "print the given text"
 desc_echo_end:
@@ -87,6 +91,10 @@ desc_calc db "basic arithmetic: calc <a> <+|-|*|/|%|sqrt> [b]"
 desc_calc_end:
 desc_usb db "scan PCI for USB host controllers (UHCI/OHCI/EHCI/xHCI)"
 desc_usb_end:
+desc_ls db "list files on the first USB drive found (FAT, read-only)"
+desc_ls_end:
+desc_dir db "same as ls"
+desc_dir_end:
 
 help_sep db " - ", 0
 color_usage_msg db "Usage: color <red|green|blue|yellow|white|HH>", 0
@@ -144,4 +152,9 @@ xhci_dbg_csz_msg db "  xhci: 64-byte contexts unsupported, skipping", 0
 xhci_dbg_reset_msg db "  xhci: reset/run timeout, skipping", 0
 xhci_dbg_scratch_msg db "  xhci: too many scratchpad buffers, skipping", 0
 xhci_dbg_timeout_msg db "  event wait timeout", 0
+
+fs_no_dev_msg db "No USB mass-storage device found.", 0
+fs_xfer_err_msg db "USB storage transfer error.", 0
+fs_no_fat_msg db "No FAT filesystem found on the USB device.", 0
+fs_dir_tag_msg db "<DIR>", 0
 

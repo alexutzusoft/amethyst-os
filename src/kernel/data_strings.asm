@@ -39,6 +39,10 @@ cursor_cmd db "cursor"
 cursor_cmd_end:
 usb_cmd db "usb"
 usb_cmd_end:
+ls_cmd db "ls"
+ls_cmd_end:
+dir_cmd db "dir"
+dir_cmd_end:
 unknown_msg db "Unknown command: ", 0
 run_bad_hex_msg db "Invalid hex byte", 0
 run_too_long_msg db "Too many bytes for exec_buffer", 0
@@ -136,6 +140,28 @@ xhci_evt_cycle db 1
 xhci_speed dd 0
 xhci_mps dd 0
 xhci_xfer_cycle db 1
+fs_found db 0
+fs_config_val db 0
+bulk_in_dci db 0
+bulk_out_dci db 0
+bulk_in_mps dw 0
+bulk_out_mps dw 0
+bulk_in_cycle db 1
+bulk_out_cycle db 1
+bot_tag dd 0
+fs_part_lba dd 0
+fs_fat_lba dd 0
+fs_root_lba dd 0
+fs_root_secs dd 0
+fs_data_lba dd 0
+fs_spc dd 0
+fs_cur_cluster dd 0
+fs_is_fat32 db 0
+fs_fat_cached dd 0
+fs_name_len dd 0
+fs_entry_off dd 0
+fs_sec_count dd 0
+fs_cur_lba dd 0
 cmd_len db 0
 cmd_buffer times CMD_BUFFER_SIZE db 0
 timer_ticks dq 0

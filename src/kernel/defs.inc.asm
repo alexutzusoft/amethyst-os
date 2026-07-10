@@ -67,8 +67,8 @@ USB_DATA_BUFFER   equ USB_SCRATCH_BASE + 0x100   ; 18 bytes (device descriptor)
 ; ID 1 and rebuilds the transfer ring fresh for each connected port. ---
 XHCI_SCRATCH_BASE  equ 0x300000
 XHCI_DCBAA         equ XHCI_SCRATCH_BASE + 0x0000  ; device context base addr array, up to 256 slots * 8B
-XHCI_INPUT_CTX     equ XHCI_SCRATCH_BASE + 0x1000  ; input control(32) + slot(32) + ep0(32) contexts
-XHCI_OUTPUT_CTX    equ XHCI_SCRATCH_BASE + 0x1100  ; slot(32) + ep0(32) contexts
+XHCI_INPUT_CTX     equ XHCI_SCRATCH_BASE + 0x1000  ; input control(32) + slot(32) + up to 31 EP contexts
+XHCI_OUTPUT_CTX    equ XHCI_SCRATCH_BASE + 0x1800  ; slot(32) + up to 31 EP contexts
 XHCI_CMD_RING      equ XHCI_SCRATCH_BASE + 0x2000  ; 64 TRBs * 16B
 XHCI_EVENT_RING    equ XHCI_SCRATCH_BASE + 0x3000  ; 16 TRBs * 16B
 XHCI_ERST          equ XHCI_SCRATCH_BASE + 0x4000  ; one 16-byte event ring segment table entry
@@ -76,6 +76,17 @@ XHCI_XFER_RING     equ XHCI_SCRATCH_BASE + 0x5000  ; EP0 control transfer ring: 
 XHCI_DATA_BUFFER   equ XHCI_SCRATCH_BASE + 0x6000  ; 18 bytes (device descriptor)
 XHCI_SCRATCH_ARRAY equ XHCI_SCRATCH_BASE + 0x7000  ; scratchpad buffer array, up to 64 pointers
 XHCI_SCRATCH_PAGES equ XHCI_SCRATCH_BASE + 0x8000  ; up to 64 * 4KB scratchpad buffer pages
+
+; --- USB mass-storage (bulk-only transport) + FAT scratch region, used by
+; the ls/dir commands (commands_fs.asm). 4MB mark: clear of the xHCI
+; scratchpad pages (XHCI_SCRATCH_PAGES + 64*4KB = 0x348000). ---
+FS_SCRATCH_BASE  equ 0x400000
+FS_BULK_OUT_RING equ FS_SCRATCH_BASE + 0x0000   ; bulk OUT transfer ring
+FS_BULK_IN_RING  equ FS_SCRATCH_BASE + 0x1000   ; bulk IN transfer ring
+FS_CBW           equ FS_SCRATCH_BASE + 0x2000   ; 31-byte command block wrapper
+FS_CSW           equ FS_SCRATCH_BASE + 0x2040   ; 13-byte command status wrapper
+FS_SECTOR_BUF    equ FS_SCRATCH_BASE + 0x3000   ; 512-byte sector reads (MBR/VBR/dir)
+FS_FAT_BUF       equ FS_SCRATCH_BASE + 0x3400   ; 512-byte cached FAT sector (FAT32 chains)
 
 ; --- BIOS memory map captured by stage1.asm's detect_memory (real mode,
 ; before the switch to protected/long mode - BIOS interrupts aren't

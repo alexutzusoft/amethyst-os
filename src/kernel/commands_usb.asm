@@ -444,168 +444,11 @@ xhci_probe_controller:
     push r13
     push r14
 
-    movzx eax, byte [rbp]
-    mov r15, rbp
-    add r15, rax                     ; r15 = operational register base
-
-    mov eax, [rbp + 0x10]             ; HCCPARAMS1
-    test eax, 1 << 2                   ; CSZ: 64-byte contexts unsupported
-    jz .csz_ok
-    mov rsi, xhci_dbg_csz_msg
-    call print_string
-    mov al, ASCII_CR
-    call print_char
-    jmp .xhci_done
-.csz_ok:
-
-    mov eax, [rbp + 4]                ; HCSPARAMS1
-    mov r14d, eax
-    shr r14d, 24
-    and r14d, 0xFF                    ; r14 = MaxPorts
-
-    mov eax, [rbp + 0x14]             ; DBOFF
-    and eax, 0xFFFFFFFC
-    mov r12, rbp
-    add r12, rax                      ; r12 = doorbell array base
-
-    mov eax, [rbp + 0x18]             ; RTSOFF
-    and eax, 0xFFFFFFE0
-    mov r13, rbp
-    add r13, rax                      ; r13 = runtime register base
-
-    ; --- halt, then reset ---
-    mov eax, [r15 + 0]
-    test eax, 1
-    jz .stopped
-    and eax, ~1
-    mov [r15 + 0], eax
-    mov ecx, 20000000
-.wait_hch:
-    mov eax, [r15 + 4]
-    test eax, 1
-    jnz .stopped
-    loop .wait_hch
-    jmp .xhci_reset_fail
-.stopped:
-    mov eax, [r15 + 0]
-    or eax, 1 << 1                     ; HCRST
-    mov [r15 + 0], eax
-    mov ecx, 20000000
-.wait_rst:
-    mov eax, [r15 + 0]
-    test eax, 1 << 1
-    jz .rst_done
-    loop .wait_rst
-    jmp .xhci_reset_fail
-.rst_done:
-    mov ecx, 20000000
-.wait_cnr:
-    mov eax, [r15 + 4]
-    test eax, 1 << 11
-    jz .cnr_done
-    loop .wait_cnr
-    jmp .xhci_reset_fail
-.cnr_done:
-
-    ; --- scratchpad buffers (many virtual xHCI controllers need none) ---
-    mov eax, [rbp + 8]                ; HCSPARAMS2
-    mov ebx, eax
-    shr ebx, 27
-    and ebx, 0x1F
-    mov ecx, eax
-    shr ecx, 21
-    and ecx, 0x1F
-    shl ebx, 5
-    or ebx, ecx                       ; ebx = MaxScratchpadBufs
-    cmp ebx, 64
-    ja .xhci_scratch_fail
-    test ebx, ebx
-    jz .no_scratch
-
-    xor edx, edx
-.scratch_fill:
-    cmp edx, ebx
-    jae .scratch_fill_done
-    mov eax, XHCI_SCRATCH_PAGES
-    mov ecx, edx
-    shl ecx, 12
-    add eax, ecx
-    mov ecx, edx
-    shl ecx, 3
-    mov edi, XHCI_SCRATCH_ARRAY
-    add edi, ecx
-    mov [edi], eax
-    mov dword [edi + 4], 0
-    inc edx
-    jmp .scratch_fill
-.scratch_fill_done:
-    mov dword [XHCI_DCBAA], XHCI_SCRATCH_ARRAY
-    mov dword [XHCI_DCBAA + 4], 0
-    jmp .dcbaa_rest
-.no_scratch:
-    mov dword [XHCI_DCBAA], 0
-    mov dword [XHCI_DCBAA + 4], 0
-.dcbaa_rest:
-    mov edi, XHCI_DCBAA + 8
-    mov ecx, 128
-    xor eax, eax
-    rep stosd
-
-    mov eax, XHCI_DCBAA
-    mov [r15 + 0x30], eax
-    mov dword [r15 + 0x34], 0
-
-    ; --- command ring ---
-    mov edi, XHCI_CMD_RING
-    mov ecx, 64 * 4
-    xor eax, eax
-    rep stosd
-    mov dword [xhci_cmd_index], 0
-    mov eax, XHCI_CMD_RING
-    or eax, 1                          ; RCS
-    mov [r15 + 0x18], eax
-    mov dword [r15 + 0x1C], 0
-
-    ; --- event ring (interrupter 0), polled rather than IRQ-driven ---
-    mov edi, XHCI_EVENT_RING
-    mov ecx, 16 * 4
-    xor eax, eax
-    rep stosd
-    mov dword [xhci_evt_index], 0
-    mov byte [xhci_evt_cycle], 1
-
-    mov edi, XHCI_ERST
-    mov eax, XHCI_EVENT_RING
-    mov [edi], eax
-    mov dword [edi + 4], 0
-    mov dword [edi + 8], 16
-    mov dword [edi + 12], 0
-
-    mov dword [r13 + 0x28], 1          ; ERSTSZ
-    mov eax, XHCI_EVENT_RING
-    mov [r13 + 0x38], eax              ; ERDP
-    mov dword [r13 + 0x3C], 0
-    mov eax, XHCI_ERST
-    mov [r13 + 0x30], eax              ; ERSTBA
-    mov dword [r13 + 0x34], 0
-
-    mov eax, [rbp + 4]                 ; HCSPARAMS1
-    and eax, 0xFF
-    mov [r15 + 0x38], eax              ; CONFIG.MaxSlotsEn
-
-    mov eax, [r15 + 0]
-    or eax, 1                          ; RS
-    mov [r15 + 0], eax
-    mov ecx, 20000000
-.wait_run:
-    mov eax, [r15 + 4]
-    test eax, 1
-    jz .run_ok
-    loop .wait_run
-    jmp .xhci_reset_fail
-.run_ok:
+    call xhci_controller_init
+    jc .xhci_done
 
     xor ebp, ebp                       ; ebp = port index (cap_base no longer needed)
+
 .port_loop:
     cmp ebp, r14d
     jae .xhci_done
@@ -879,22 +722,198 @@ xhci_probe_controller:
     inc ebp
     jmp .port_loop
 
-.xhci_reset_fail:
-    mov rsi, xhci_dbg_reset_msg
-    call print_string
-    mov al, ASCII_CR
-    call print_char
-    jmp .xhci_done
-.xhci_scratch_fail:
-    mov rsi, xhci_dbg_scratch_msg
-    call print_string
-    mov al, ASCII_CR
-    call print_char
 .xhci_done:
     pop r14
     pop r13
     pop r12
     pop r9
+    ret
+
+; --- Reset and bring one xHCI controller up to Run state: caps parse,
+; halt/reset, scratchpad buffers, DCBAA, command ring, event ring, start.
+; rbp = capability register base (identity-mapped, <4GB). On success (CF
+; clear): r12 = doorbell array base, r13 = runtime register base,
+; r14 = MaxPorts, r15 = operational register base. CF set on failure
+; (diagnostic already printed). Bails out on 64-byte contexts (CSZ=1) or
+; >64 scratchpad buffers, neither of which the static scratch layout
+; supports. ---
+xhci_controller_init:
+    movzx eax, byte [rbp]
+    mov r15, rbp
+    add r15, rax                     ; r15 = operational register base
+
+    mov eax, [rbp + 0x10]             ; HCCPARAMS1
+    test eax, 1 << 2                   ; CSZ: 64-byte contexts unsupported
+    jz .csz_ok
+    mov rsi, xhci_dbg_csz_msg
+    call print_string
+    mov al, ASCII_CR
+    call print_char
+    stc
+    ret
+.csz_ok:
+    mov eax, [rbp + 4]                ; HCSPARAMS1
+    mov r14d, eax
+    shr r14d, 24
+    and r14d, 0xFF                    ; r14 = MaxPorts
+
+    mov eax, [rbp + 0x14]             ; DBOFF
+    and eax, 0xFFFFFFFC
+    mov r12, rbp
+    add r12, rax                      ; r12 = doorbell array base
+
+    mov eax, [rbp + 0x18]             ; RTSOFF
+    and eax, 0xFFFFFFE0
+    mov r13, rbp
+    add r13, rax                      ; r13 = runtime register base
+
+    ; --- halt, then reset ---
+    mov eax, [r15 + 0]
+    test eax, 1
+    jz .stopped
+    and eax, ~1
+    mov [r15 + 0], eax
+    mov ecx, 20000000
+.wait_hch:
+    mov eax, [r15 + 4]
+    test eax, 1
+    jnz .stopped
+    loop .wait_hch
+    jmp .xhci_reset_fail
+.stopped:
+    mov eax, [r15 + 0]
+    or eax, 1 << 1                     ; HCRST
+    mov [r15 + 0], eax
+    mov ecx, 20000000
+.wait_rst:
+    mov eax, [r15 + 0]
+    test eax, 1 << 1
+    jz .rst_done
+    loop .wait_rst
+    jmp .xhci_reset_fail
+.rst_done:
+    mov ecx, 20000000
+.wait_cnr:
+    mov eax, [r15 + 4]
+    test eax, 1 << 11
+    jz .cnr_done
+    loop .wait_cnr
+    jmp .xhci_reset_fail
+.cnr_done:
+
+    ; --- scratchpad buffers (many virtual xHCI controllers need none) ---
+    mov eax, [rbp + 8]                ; HCSPARAMS2
+    mov ebx, eax
+    shr ebx, 27
+    and ebx, 0x1F
+    mov ecx, eax
+    shr ecx, 21
+    and ecx, 0x1F
+    shl ebx, 5
+    or ebx, ecx                       ; ebx = MaxScratchpadBufs
+    cmp ebx, 64
+    ja .xhci_scratch_fail
+    test ebx, ebx
+    jz .no_scratch
+
+    xor edx, edx
+.scratch_fill:
+    cmp edx, ebx
+    jae .scratch_fill_done
+    mov eax, XHCI_SCRATCH_PAGES
+    mov ecx, edx
+    shl ecx, 12
+    add eax, ecx
+    mov ecx, edx
+    shl ecx, 3
+    mov edi, XHCI_SCRATCH_ARRAY
+    add edi, ecx
+    mov [edi], eax
+    mov dword [edi + 4], 0
+    inc edx
+    jmp .scratch_fill
+.scratch_fill_done:
+    mov dword [XHCI_DCBAA], XHCI_SCRATCH_ARRAY
+    mov dword [XHCI_DCBAA + 4], 0
+    jmp .dcbaa_rest
+.no_scratch:
+    mov dword [XHCI_DCBAA], 0
+    mov dword [XHCI_DCBAA + 4], 0
+.dcbaa_rest:
+    mov edi, XHCI_DCBAA + 8
+    mov ecx, 128
+    xor eax, eax
+    rep stosd
+
+    mov eax, XHCI_DCBAA
+    mov [r15 + 0x30], eax
+    mov dword [r15 + 0x34], 0
+
+    ; --- command ring ---
+    mov edi, XHCI_CMD_RING
+    mov ecx, 64 * 4
+    xor eax, eax
+    rep stosd
+    mov dword [xhci_cmd_index], 0
+    mov eax, XHCI_CMD_RING
+    or eax, 1                          ; RCS
+    mov [r15 + 0x18], eax
+    mov dword [r15 + 0x1C], 0
+
+    ; --- event ring (interrupter 0), polled rather than IRQ-driven ---
+    mov edi, XHCI_EVENT_RING
+    mov ecx, 16 * 4
+    xor eax, eax
+    rep stosd
+    mov dword [xhci_evt_index], 0
+    mov byte [xhci_evt_cycle], 1
+
+    mov edi, XHCI_ERST
+    mov eax, XHCI_EVENT_RING
+    mov [edi], eax
+    mov dword [edi + 4], 0
+    mov dword [edi + 8], 16
+    mov dword [edi + 12], 0
+
+    mov dword [r13 + 0x28], 1          ; ERSTSZ
+    mov eax, XHCI_EVENT_RING
+    mov [r13 + 0x38], eax              ; ERDP
+    mov dword [r13 + 0x3C], 0
+    mov eax, XHCI_ERST
+    mov [r13 + 0x30], eax              ; ERSTBA
+    mov dword [r13 + 0x34], 0
+
+    mov eax, [rbp + 4]                 ; HCSPARAMS1
+    and eax, 0xFF
+    mov [r15 + 0x38], eax              ; CONFIG.MaxSlotsEn
+
+    mov eax, [r15 + 0]
+    or eax, 1                          ; RS
+    mov [r15 + 0], eax
+    mov ecx, 20000000
+.wait_run:
+    mov eax, [r15 + 4]
+    test eax, 1
+    jz .run_ok
+    loop .wait_run
+    jmp .xhci_reset_fail
+.run_ok:
+    clc
+    ret
+
+.xhci_reset_fail:
+    mov rsi, xhci_dbg_reset_msg
+    call print_string
+    mov al, ASCII_CR
+    call print_char
+    stc
+    ret
+.xhci_scratch_fail:
+    mov rsi, xhci_dbg_scratch_msg
+    call print_string
+    mov al, ASCII_CR
+    call print_char
+    stc
     ret
 
 ; --- "usb" handler: brute-force scan all 256 buses x 32 devices x 8 funcs

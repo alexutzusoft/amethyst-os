@@ -1,0 +1,981 @@
+; --- "ls"/"dir" handlers: read-only FAT12/16/32 root-directory listing of
+; the first USB mass-storage device found on an xHCI controller. Bulk-only
+; transport (CBW/CSW) with SCSI READ(10), one 512-byte sector at a time.
+; Register conventions match commands_usb.asm's xHCI code: r10d = slot id,
+; r12 = doorbell array base, r13 = runtime register base, r15 = operational
+; register base, ebp = port index. All listing loop state lives in memory
+; variables - print_char/print_string clobber rax/rbx/rdx/rdi. ---
+
+; --- One control transfer on EP0 of slot r10d. rax = the 8-byte setup
+; packet (bmRequestType..wLength, in USB wire order as a little-endian
+; qword). If wLength > 0, the data stage targets XHCI_DATA_BUFFER, with
+; direction taken from bmRequestType bit 7. CF set on timeout/failure. ---
+fs_ctrl_xfer:
+    push rbx
+    push rcx
+    push rdx
+    push rdi
+    push r8
+    push r9
+    push r11
+    mov rbx, rax                     ; rbx = setup packet
+    mov r8, rbx
+    shr r8, 48                       ; r8w = wLength
+    movzx r9d, byte [xhci_xfer_cycle]
+    mov edi, XHCI_XFER_RING
+    mov [rdi], rbx                   ; setup packet = TRB parameter (IDT)
+    mov dword [rdi + 8], 8
+    xor ecx, ecx                     ; TRT: 0 = no data stage
+    test r8w, r8w
+    jz .trt_done
+    mov ecx, 2                       ; TRT: 2 = OUT data stage
+    test bl, 0x80
+    jz .trt_done
+    mov ecx, 3                       ; TRT: 3 = IN data stage
+.trt_done:
+    shl ecx, 16
+    or ecx, (2 << 10) | (1 << 6)     ; SETUP_STAGE, IDT
+    or ecx, r9d
+    mov [rdi + 12], ecx
+    add edi, 16
+    test r8w, r8w
+    jz .no_data
+    mov dword [rdi + 0], XHCI_DATA_BUFFER
+    mov dword [rdi + 4], 0
+    movzx ecx, r8w
+    mov [rdi + 8], ecx
+    mov ecx, (3 << 10)               ; DATA_STAGE
+    test bl, 0x80
+    jz .data_dir_done
+    or ecx, 1 << 16                  ; DIR=IN
+.data_dir_done:
+    or ecx, r9d
+    mov [rdi + 12], ecx
+    add edi, 16
+.no_data:
+    mov dword [rdi + 0], 0
+    mov dword [rdi + 4], 0
+    mov dword [rdi + 8], 0
+    mov ecx, (4 << 10) | (1 << 5) | (1 << 16)   ; STATUS_STAGE, IOC, DIR=IN
+    test r8w, r8w
+    jz .stat_done
+    test bl, 0x80
+    jz .stat_done
+    and ecx, ~(1 << 16)              ; data stage was IN -> status OUT
+.stat_done:
+    or ecx, r9d
+    mov [rdi + 12], ecx
+    add edi, 16
+    mov dword [rdi + 0], XHCI_XFER_RING
+    mov dword [rdi + 4], 0
+    mov dword [rdi + 8], 0
+    mov ecx, (6 << 10) | (1 << 1)    ; LINK, TC=1
+    or ecx, r9d
+    mov [rdi + 12], ecx
+    xor byte [xhci_xfer_cycle], 1
+    mov eax, r10d
+    shl eax, 2
+    mov rdi, r12
+    add edi, eax
+    mov dword [edi], 1               ; ring EP0 doorbell (DCI 1)
+    mov dl, 32                       ; Transfer Event
+    call xhci_wait_event
+    jc .fail
+    mov eax, [rsi + 8]
+    shr eax, 24
+    cmp eax, 1                       ; Success
+    je .ok
+    cmp eax, 13                      ; Short Packet (fine: wLength was a max)
+    je .ok
+.fail:
+    stc
+    jmp .out
+.ok:
+    clc
+.out:
+    pop r11
+    pop r9
+    pop r8
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; --- One bulk transfer on the configured mass-storage endpoints of slot
+; r10d: a single Normal TRB + Link TRB rebuilt at the ring start each call,
+; toggling the producer cycle (same trick as the EP0 control ring).
+; edi = buffer, ecx = byte count. CF set on timeout/failure. ---
+fs_bulk_in:
+    push r8
+    push r9
+    movzx r8d, byte [bulk_in_dci]
+    movzx r9d, byte [bulk_in_cycle]
+    xor byte [bulk_in_cycle], 1
+    mov esi, FS_BULK_IN_RING
+    jmp fs_bulk_go
+fs_bulk_out:
+    push r8
+    push r9
+    movzx r8d, byte [bulk_out_dci]
+    movzx r9d, byte [bulk_out_cycle]
+    xor byte [bulk_out_cycle], 1
+    mov esi, FS_BULK_OUT_RING
+fs_bulk_go:
+    mov [rsi + 0], edi
+    mov dword [rsi + 4], 0
+    mov [rsi + 8], ecx
+    mov eax, (1 << 10) | (1 << 5)    ; NORMAL, IOC
+    or eax, r9d
+    mov [rsi + 12], eax
+    mov [rsi + 16], esi              ; LINK back to ring start
+    mov dword [rsi + 20], 0
+    mov dword [rsi + 24], 0
+    mov eax, (6 << 10) | (1 << 1)    ; LINK, TC=1
+    or eax, r9d
+    mov [rsi + 28], eax
+    mov eax, r10d
+    shl eax, 2
+    mov rdi, r12
+    add edi, eax
+    mov [edi], r8d                   ; ring doorbell with the endpoint's DCI
+    mov dl, 32                       ; Transfer Event
+    call xhci_wait_event
+    jc .fail
+    mov eax, [rsi + 8]
+    shr eax, 24
+    cmp eax, 1                       ; Success
+    je .ok
+    cmp eax, 13                      ; Short Packet
+    je .ok
+.fail:
+    pop r9
+    pop r8
+    stc
+    ret
+.ok:
+    pop r9
+    pop r8
+    clc
+    ret
+
+; --- Run one SCSI command over bulk-only transport. Caller pre-fills the
+; CDB at FS_CBW+15.., dataTransferLength at FS_CBW+8, flags at FS_CBW+12
+; and CDB length at FS_CBW+14; edi = data-in buffer (dtl > 0 is IN-only
+; here - every command ls needs reads from the device). CF on any bulk
+; failure, bad CSW signature, or non-zero CSW status. ---
+fs_scsi_cmd:
+    push rbx
+    mov ebx, edi                     ; save data buffer
+    mov eax, [bot_tag]
+    inc dword [bot_tag]
+    mov dword [FS_CBW + 0], 0x43425355   ; 'USBC'
+    mov [FS_CBW + 4], eax
+    mov byte [FS_CBW + 13], 0        ; LUN 0
+    mov edi, FS_CBW
+    mov ecx, 31
+    call fs_bulk_out
+    jc .fail
+    mov ecx, [FS_CBW + 8]
+    test ecx, ecx
+    jz .csw
+    mov edi, ebx
+    call fs_bulk_in
+    jc .fail
+.csw:
+    mov edi, FS_CSW
+    mov ecx, 13
+    call fs_bulk_in
+    jc .fail
+    cmp dword [FS_CSW], 0x53425355   ; 'USBS'
+    jne .fail
+    cmp byte [FS_CSW + 12], 0        ; bCSWStatus: 0 = passed
+    jne .fail
+    pop rbx
+    clc
+    ret
+.fail:
+    pop rbx
+    stc
+    ret
+
+; --- SCSI READ(10): one 512-byte sector. eax = absolute LBA, edi = buffer. ---
+fs_read_sector:
+    push rcx
+    mov dword [FS_CBW + 8], 512
+    mov byte [FS_CBW + 12], 0x80     ; device-to-host
+    mov byte [FS_CBW + 14], 10
+    mov byte [FS_CBW + 15], 0x28     ; READ(10)
+    mov byte [FS_CBW + 16], 0
+    bswap eax
+    mov [FS_CBW + 17], eax           ; LBA, big-endian
+    mov dword [FS_CBW + 21], 0x00010000  ; group 0, count 0x0001 BE, control 0
+    mov dword [FS_CBW + 25], 0
+    mov word [FS_CBW + 29], 0
+    call fs_scsi_cmd
+    pop rcx
+    ret
+
+; --- SCSI TEST UNIT READY (no data). CF = not ready. ---
+fs_test_ready:
+    mov dword [FS_CBW + 8], 0
+    mov byte [FS_CBW + 12], 0
+    mov byte [FS_CBW + 14], 6
+    mov dword [FS_CBW + 15], 0
+    mov dword [FS_CBW + 19], 0
+    mov dword [FS_CBW + 23], 0
+    mov dword [FS_CBW + 27], 0
+    xor edi, edi
+    jmp fs_scsi_cmd
+
+; --- SCSI REQUEST SENSE (18 bytes in, discarded): clears the unit-attention
+; condition many sticks report right after configuration, so the next TEST
+; UNIT READY can succeed. ---
+fs_req_sense:
+    mov dword [FS_CBW + 8], 18
+    mov byte [FS_CBW + 12], 0x80
+    mov byte [FS_CBW + 14], 6
+    mov dword [FS_CBW + 15], 0x00000003
+    mov dword [FS_CBW + 19], 0x00000012  ; allocation length 18
+    mov dword [FS_CBW + 23], 0
+    mov dword [FS_CBW + 27], 0
+    mov edi, XHCI_DATA_BUFFER
+    jmp fs_scsi_cmd
+
+; --- Parse the configuration descriptor at XHCI_DATA_BUFFER: find a
+; mass-storage bulk-only interface (class 08, protocol 50) and its bulk
+; IN/OUT endpoints. Stores fs_config_val, bulk_in/out_dci and _mps.
+; CF set if this is not a usable mass-storage device. ---
+fs_parse_config:
+    push rbx
+    mov byte [bulk_in_dci], 0
+    mov byte [bulk_out_dci], 0
+    mov esi, XHCI_DATA_BUFFER
+    movzx ecx, word [rsi + 2]        ; wTotalLength
+    cmp ecx, 255
+    jbe .len_ok
+    mov ecx, 255                     ; only fetched this much
+.len_ok:
+    mov al, [rsi + 5]                ; bConfigurationValue
+    mov [fs_config_val], al
+    xor ebx, ebx                     ; bl = inside mass-storage interface
+    xor edx, edx                     ; edx = walk offset
+.walk:
+    movzx eax, byte [rsi + rdx]      ; bLength
+    test eax, eax
+    jz .walk_done
+    mov al, [rsi + rdx + 1]          ; bDescriptorType
+    cmp al, 4                        ; INTERFACE
+    jne .not_iface
+    xor ebx, ebx
+    cmp byte [rsi + rdx + 5], 0x08   ; bInterfaceClass: mass storage
+    jne .next
+    cmp byte [rsi + rdx + 7], 0x50   ; bInterfaceProtocol: bulk-only
+    jne .next
+    mov bl, 1
+    jmp .next
+.not_iface:
+    cmp al, 5                        ; ENDPOINT
+    jne .next
+    test bl, bl
+    jz .next
+    mov al, [rsi + rdx + 3]
+    and al, 3
+    cmp al, 2                        ; bulk?
+    jne .next
+    movzx r8d, byte [rsi + rdx + 2]  ; bEndpointAddress
+    mov r9d, r8d
+    and r9d, 0x0F
+    shl r9d, 1                       ; DCI = epnum*2 (+1 for IN)
+    test r8b, 0x80
+    jz .ep_out
+    or r9d, 1
+    mov [bulk_in_dci], r9b
+    mov ax, [rsi + rdx + 4]
+    mov [bulk_in_mps], ax
+    jmp .next
+.ep_out:
+    mov [bulk_out_dci], r9b
+    mov ax, [rsi + rdx + 4]
+    mov [bulk_out_mps], ax
+.next:
+    movzx eax, byte [rsi + rdx]
+    add edx, eax
+    cmp edx, ecx
+    jb .walk
+.walk_done:
+    cmp byte [bulk_in_dci], 0
+    je .no
+    cmp byte [bulk_out_dci], 0
+    je .no
+    pop rbx
+    clc
+    ret
+.no:
+    pop rbx
+    stc
+    ret
+
+; --- Configure Endpoint command: add the two bulk endpoints to slot r10d's
+; device context and initialize their transfer rings. CF on failure. ---
+fs_configure_endpoints:
+    mov edi, XHCI_INPUT_CTX
+    mov ecx, 264                     ; input control + slot + 31 EP contexts
+    xor eax, eax
+    rep stosd
+    movzx ecx, byte [bulk_in_dci]
+    mov ebx, 1
+    shl ebx, cl
+    movzx ecx, byte [bulk_out_dci]
+    mov eax, 1
+    shl eax, cl
+    or ebx, eax
+    or ebx, 1                        ; A0: slot context
+    mov [XHCI_INPUT_CTX + 4], ebx
+    movzx eax, byte [bulk_in_dci]
+    movzx ecx, byte [bulk_out_dci]
+    cmp eax, ecx
+    jae .have_max
+    mov eax, ecx
+.have_max:
+    shl eax, 27                      ; context entries = max DCI
+    mov ecx, [xhci_speed]
+    shl ecx, 20
+    or eax, ecx
+    mov [XHCI_INPUT_CTX + 0x20], eax
+    mov eax, ebp
+    inc eax
+    shl eax, 16                      ; root hub port number
+    mov [XHCI_INPUT_CTX + 0x24], eax
+    ; bulk IN endpoint context
+    movzx eax, byte [bulk_in_dci]
+    shl eax, 5
+    lea edi, [eax + XHCI_INPUT_CTX + 0x20]
+    movzx ecx, word [bulk_in_mps]
+    shl ecx, 16
+    or ecx, (6 << 3) | (3 << 1)      ; EP type Bulk IN, CErr=3
+    mov [rdi + 4], ecx
+    mov dword [rdi + 8], FS_BULK_IN_RING | 1   ; TR dequeue, DCS=1
+    mov dword [rdi + 12], 0
+    mov dword [rdi + 16], 512        ; average TRB length
+    ; bulk OUT endpoint context
+    movzx eax, byte [bulk_out_dci]
+    shl eax, 5
+    lea edi, [eax + XHCI_INPUT_CTX + 0x20]
+    movzx ecx, word [bulk_out_mps]
+    shl ecx, 16
+    or ecx, (2 << 3) | (3 << 1)      ; EP type Bulk OUT, CErr=3
+    mov [rdi + 4], ecx
+    mov dword [rdi + 8], FS_BULK_OUT_RING | 1
+    mov dword [rdi + 12], 0
+    mov dword [rdi + 16], 512
+    ; fresh rings + producer cycles
+    mov edi, FS_BULK_OUT_RING
+    mov ecx, 2048                    ; both contiguous 4KB rings
+    xor eax, eax
+    rep stosd
+    mov byte [bulk_in_cycle], 1
+    mov byte [bulk_out_cycle], 1
+    mov dword [bot_tag], 1
+    ; issue the command
+    mov eax, [xhci_cmd_index]
+    cmp eax, 62
+    jae .fail
+    mov edi, eax
+    shl edi, 4
+    add edi, XHCI_CMD_RING
+    mov dword [edi + 0], XHCI_INPUT_CTX
+    mov dword [edi + 4], 0
+    mov dword [edi + 8], 0
+    mov eax, r10d
+    shl eax, 24
+    or eax, (12 << 10) | 1           ; CONFIGURE_ENDPOINT, Cycle=1
+    mov [edi + 12], eax
+    inc dword [xhci_cmd_index]
+    mov dword [r12], 0
+    mov dl, 33                       ; Command Completion Event
+    call xhci_wait_event
+    jc .fail
+    mov eax, [rsi + 8]
+    shr eax, 24
+    cmp eax, 1
+    jne .fail
+    clc
+    ret
+.fail:
+    stc
+    ret
+
+; --- Disable slot r10d (same cleanup the usb command's probe does). ---
+fs_disable_slot:
+    mov eax, [xhci_cmd_index]
+    cmp eax, 62
+    jae .done
+    mov edi, eax
+    shl edi, 4
+    add edi, XHCI_CMD_RING
+    mov dword [edi + 0], 0
+    mov dword [edi + 4], 0
+    mov dword [edi + 8], 0
+    mov eax, r10d
+    shl eax, 24
+    or eax, (10 << 10) | 1           ; DISABLE_SLOT, Cycle=1
+    mov [edi + 12], eax
+    inc dword [xhci_cmd_index]
+    mov dword [r12], 0
+    mov dl, 33
+    call xhci_wait_event
+.done:
+    ret
+
+; --- Locate and parse the FAT volume: read LBA 0, accept it directly as a
+; FAT boot sector ("superfloppy") or walk the MBR partition table to the
+; first partition whose start sector parses as one. Fills the fs_* volume
+; variables. CF set if no FAT filesystem was found (or a read failed). ---
+fs_mount:
+    push rbx
+    mov dword [fs_part_lba], 0
+    mov dword [fs_fat_cached], 0xFFFFFFFF
+    xor eax, eax
+    mov edi, FS_SECTOR_BUF
+    call fs_read_sector
+    jc .fail
+    cmp word [FS_SECTOR_BUF + 510], 0xAA55
+    jne .fail
+    call fs_is_vbr
+    jnc .parse
+    mov ebx, FS_SECTOR_BUF + 446
+    mov ecx, 4
+.part_loop:
+    cmp byte [rbx + 4], 0            ; partition type
+    je .part_next
+    mov eax, [rbx + 8]               ; start LBA
+    test eax, eax
+    jz .part_next
+    mov [fs_part_lba], eax
+    push rcx
+    mov edi, FS_SECTOR_BUF
+    call fs_read_sector
+    pop rcx
+    jc .fail
+    cmp word [FS_SECTOR_BUF + 510], 0xAA55
+    jne .part_next
+    call fs_is_vbr
+    jnc .parse
+.part_next:
+    add ebx, 16
+    loop .part_loop
+    jmp .fail
+.parse:
+    cmp word [FS_SECTOR_BUF + 11], 512   ; only 512-byte sectors supported
+    jne .fail
+    movzx eax, byte [FS_SECTOR_BUF + 13] ; sectors/cluster
+    test eax, eax
+    jz .fail
+    mov [fs_spc], eax
+    movzx ebx, word [FS_SECTOR_BUF + 14] ; reserved sectors
+    add ebx, [fs_part_lba]
+    mov [fs_fat_lba], ebx
+    movzx eax, word [FS_SECTOR_BUF + 22] ; FATSz16
+    test eax, eax
+    jnz .have_fatsz
+    mov eax, [FS_SECTOR_BUF + 36]        ; FATSz32
+.have_fatsz:
+    movzx ecx, byte [FS_SECTOR_BUF + 16] ; number of FATs
+    imul eax, ecx
+    add ebx, eax
+    mov [fs_root_lba], ebx               ; FAT12/16 fixed root region
+    movzx eax, word [FS_SECTOR_BUF + 17] ; root entry count
+    shl eax, 5
+    add eax, 511
+    shr eax, 9
+    mov [fs_root_secs], eax
+    add ebx, eax
+    mov [fs_data_lba], ebx               ; first sector of cluster 2
+    mov byte [fs_is_fat32], 0
+    cmp word [FS_SECTOR_BUF + 17], 0     ; no fixed root -> FAT32
+    jne .done
+    mov byte [fs_is_fat32], 1
+    mov eax, [FS_SECTOR_BUF + 44]        ; root directory cluster
+    and eax, 0x0FFFFFFF
+    mov [fs_cur_cluster], eax
+.done:
+    pop rbx
+    clc
+    ret
+.fail:
+    pop rbx
+    stc
+    ret
+
+; --- Does FS_SECTOR_BUF look like a FAT boot sector? CF clear if yes. ---
+fs_is_vbr:
+    cmp byte [FS_SECTOR_BUF], 0xEB
+    je .chk
+    cmp byte [FS_SECTOR_BUF], 0xE9
+    jne .no
+.chk:
+    cmp word [FS_SECTOR_BUF + 11], 512
+    jne .no
+    cmp byte [FS_SECTOR_BUF + 13], 0
+    je .no
+    clc
+    ret
+.no:
+    stc
+    ret
+
+; --- List the root directory of the mounted volume. FAT12/16: walk the
+; fixed root region; FAT32: follow the root cluster chain through the FAT.
+; CF set on read error. ---
+fs_list_root:
+    cmp byte [fs_is_fat32], 0
+    jne .fat32
+    mov eax, [fs_root_lba]
+    mov [fs_cur_lba], eax
+    mov eax, [fs_root_secs]
+    mov [fs_sec_count], eax
+.f16_loop:
+    cmp dword [fs_sec_count], 0
+    je .done
+    mov eax, [fs_cur_lba]
+    mov edi, FS_SECTOR_BUF
+    call fs_read_sector
+    jc .fail
+    call fs_list_sector
+    jc .done                         ; hit the end-of-directory marker
+    inc dword [fs_cur_lba]
+    dec dword [fs_sec_count]
+    jmp .f16_loop
+.fat32:
+.clus_loop:
+    mov eax, [fs_cur_cluster]
+    cmp eax, 2
+    jb .done
+    cmp eax, 0x0FFFFFF8              ; end-of-chain
+    jae .done
+    sub eax, 2
+    imul eax, [fs_spc]
+    add eax, [fs_data_lba]
+    mov [fs_cur_lba], eax
+    mov eax, [fs_spc]
+    mov [fs_sec_count], eax
+.f32_sec_loop:
+    cmp dword [fs_sec_count], 0
+    je .next_clus
+    mov eax, [fs_cur_lba]
+    mov edi, FS_SECTOR_BUF
+    call fs_read_sector
+    jc .fail
+    call fs_list_sector
+    jc .done
+    inc dword [fs_cur_lba]
+    dec dword [fs_sec_count]
+    jmp .f32_sec_loop
+.next_clus:
+    mov eax, [fs_cur_cluster]
+    shr eax, 7                       ; 128 FAT32 entries per sector
+    add eax, [fs_fat_lba]
+    cmp eax, [fs_fat_cached]
+    je .cached
+    mov [fs_fat_cached], eax
+    mov edi, FS_FAT_BUF
+    call fs_read_sector
+    jnc .cached
+    mov dword [fs_fat_cached], 0xFFFFFFFF
+    jmp .fail
+.cached:
+    mov eax, [fs_cur_cluster]
+    and eax, 127
+    mov eax, [FS_FAT_BUF + rax*4]
+    and eax, 0x0FFFFFFF
+    mov [fs_cur_cluster], eax
+    jmp .clus_loop
+.done:
+    clc
+    ret
+.fail:
+    stc
+    ret
+
+; --- Print the 16 directory entries in FS_SECTOR_BUF, skipping deleted
+; entries, long-file-name entries and the volume label. CF set when the
+; 0x00 end-of-directory marker is hit. ---
+fs_list_sector:
+    mov dword [fs_entry_off], 0
+.loop:
+    mov eax, [fs_entry_off]
+    cmp eax, 512
+    jae .not_end
+    mov esi, FS_SECTOR_BUF
+    add esi, eax
+    mov al, [rsi]
+    test al, al
+    jz .end_marker
+    cmp al, 0xE5                     ; deleted
+    je .skip
+    mov al, [rsi + 11]
+    test al, 0x08                    ; volume label (LFN's 0x0F includes it)
+    jnz .skip
+    call fs_print_entry
+.skip:
+    add dword [fs_entry_off], 32
+    jmp .loop
+.not_end:
+    clc
+    ret
+.end_marker:
+    stc
+    ret
+
+; --- Print one 8.3 directory entry at rsi: "NAME.EXT" padded to a column,
+; then "<DIR>" or the file size in bytes. ---
+fs_print_entry:
+    mov dword [fs_name_len], 0
+    xor ecx, ecx
+.name_loop:
+    cmp ecx, 8
+    jae .name_done
+    mov al, [rsi + rcx]
+    cmp al, ' '
+    je .name_done
+    call print_char
+    inc dword [fs_name_len]
+    inc ecx
+    jmp .name_loop
+.name_done:
+    cmp byte [rsi + 8], ' '
+    je .ext_done
+    mov al, '.'
+    call print_char
+    inc dword [fs_name_len]
+    mov ecx, 8
+.ext_loop:
+    cmp ecx, 11
+    jae .ext_done
+    mov al, [rsi + rcx]
+    cmp al, ' '
+    je .ext_done
+    call print_char
+    inc dword [fs_name_len]
+    inc ecx
+    jmp .ext_loop
+.ext_done:
+.pad_loop:
+    cmp dword [fs_name_len], 14
+    jae .pad_done
+    mov al, ' '
+    call print_char
+    inc dword [fs_name_len]
+    jmp .pad_loop
+.pad_done:
+    mov al, [rsi + 11]
+    test al, 0x10                    ; directory?
+    jz .file
+    push rsi
+    mov rsi, fs_dir_tag_msg
+    call print_string
+    pop rsi
+    jmp .cr
+.file:
+    mov eax, [rsi + 28]              ; file size
+    call print_dec64
+.cr:
+    mov al, ASCII_CR
+    call print_char
+    ret
+
+; --- Bring up the device on port ebp and, if it is a bulk-only
+; mass-storage device, mount its FAT volume and list the root directory.
+; CF set = nothing usable on this port, keep scanning. CF clear = handled
+; (listed, or a diagnostic was printed); fs_found set stops the scan. ---
+fs_try_port:
+    lea rdi, [r15 + 0x400]
+    mov eax, ebp
+    shl eax, 4
+    add rdi, rax                     ; rdi -> PORTSC(port)
+    mov eax, [rdi]
+    test eax, 1                      ; CCS
+    jz .fail
+    mov edx, eax
+    shr edx, 10
+    and edx, 0xF                     ; speed
+    test eax, 1 << 1                 ; already enabled?
+    jnz .port_ready
+    mov ebx, eax
+    and ebx, 0xFF01FFFD              ; clear PED + RW1C change bits
+    or ebx, 1 << 4                   ; PR
+    mov [rdi], ebx
+    mov ecx, 20000000
+.wait_prc:
+    mov eax, [rdi]
+    test eax, 1 << 21                ; PRC
+    jnz .prc_set
+    loop .wait_prc
+    jmp .fail
+.prc_set:
+    mov ebx, eax
+    and ebx, 0xFF01FFFD
+    mov [rdi], ebx
+    mov eax, [rdi]
+    test eax, 1 << 1                 ; PED
+    jz .fail
+    mov edx, eax
+    shr edx, 10
+    and edx, 0xF
+.port_ready:
+    mov [xhci_speed], edx
+    cmp edx, 3
+    je .mps64
+    cmp edx, 4
+    jae .mps512
+    mov dword [xhci_mps], 8
+    jmp .mps_done
+.mps64:
+    mov dword [xhci_mps], 64
+    jmp .mps_done
+.mps512:
+    mov dword [xhci_mps], 512
+.mps_done:
+    ; --- Enable Slot ---
+    mov eax, [xhci_cmd_index]
+    cmp eax, 62
+    jae .fail
+    mov edi, eax
+    shl edi, 4
+    add edi, XHCI_CMD_RING
+    mov dword [edi + 0], 0
+    mov dword [edi + 4], 0
+    mov dword [edi + 8], 0
+    mov dword [edi + 12], (9 << 10) | 1   ; ENABLE_SLOT, Cycle=1
+    inc dword [xhci_cmd_index]
+    mov dword [r12], 0
+    mov dl, 33
+    call xhci_wait_event
+    jc .fail
+    mov eax, [rsi + 8]
+    shr eax, 24
+    cmp eax, 1
+    jne .fail
+    mov eax, [rsi + 12]
+    shr eax, 24
+    mov r10d, eax                    ; r10 = slot id
+    ; --- input/output contexts: slot + EP0 ---
+    mov edi, XHCI_INPUT_CTX
+    mov ecx, 264
+    xor eax, eax
+    rep stosd
+    mov edi, XHCI_OUTPUT_CTX
+    mov ecx, 264
+    xor eax, eax
+    rep stosd
+    mov dword [XHCI_INPUT_CTX + 4], 0x3   ; A0 | A1
+    mov eax, [xhci_speed]
+    shl eax, 20
+    or eax, 1 << 27                  ; context entries = 1
+    mov [XHCI_INPUT_CTX + 0x20], eax
+    mov eax, ebp
+    inc eax
+    shl eax, 16                      ; root hub port number
+    mov [XHCI_INPUT_CTX + 0x24], eax
+    mov eax, 4 << 3                  ; EP type Control
+    or eax, 3 << 1                   ; CErr=3
+    mov ecx, [xhci_mps]
+    shl ecx, 16
+    or eax, ecx
+    mov [XHCI_INPUT_CTX + 0x44], eax
+    mov eax, XHCI_XFER_RING
+    and eax, 0xFFFFFFF0
+    or eax, 1                        ; DCS
+    mov [XHCI_INPUT_CTX + 0x48], eax
+    mov dword [XHCI_INPUT_CTX + 0x4C], 0
+    mov dword [XHCI_INPUT_CTX + 0x50], 8
+    mov byte [xhci_xfer_cycle], 1
+    mov eax, r10d
+    shl eax, 3
+    mov edi, XHCI_DCBAA
+    add edi, eax
+    mov dword [edi], XHCI_OUTPUT_CTX
+    mov dword [edi + 4], 0
+    ; --- Address Device ---
+    mov eax, [xhci_cmd_index]
+    cmp eax, 62
+    jae .disable
+    mov edi, eax
+    shl edi, 4
+    add edi, XHCI_CMD_RING
+    mov dword [edi + 0], XHCI_INPUT_CTX
+    mov dword [edi + 4], 0
+    mov dword [edi + 8], 0
+    mov eax, r10d
+    shl eax, 24
+    or eax, (11 << 10) | 1           ; ADDRESS_DEVICE, Cycle=1
+    mov [edi + 12], eax
+    inc dword [xhci_cmd_index]
+    mov dword [r12], 0
+    mov dl, 33
+    call xhci_wait_event
+    jc .disable
+    mov eax, [rsi + 8]
+    shr eax, 24
+    cmp eax, 1
+    jne .disable
+    ; --- GET_DESCRIPTOR(Configuration, 0), wLength=255 ---
+    mov rax, 0x00FF000002000680
+    call fs_ctrl_xfer
+    jc .disable
+    call fs_parse_config
+    jc .disable                      ; not mass storage - keep scanning
+    ; --- SET_CONFIGURATION ---
+    movzx eax, byte [fs_config_val]
+    shl eax, 16
+    or eax, 0x0900
+    call fs_ctrl_xfer
+    jc .disable
+    call fs_configure_endpoints
+    jc .io_err
+    ; --- wait for the unit to become ready ---
+    mov r11d, 8
+.tur_loop:
+    call fs_test_ready
+    jnc .ready
+    call fs_req_sense                ; clear unit attention, ignore result
+    dec r11d
+    jnz .tur_loop
+    jmp .io_err
+.ready:
+    call fs_mount
+    jc .fs_err
+    call fs_list_root
+    jc .io_err
+    mov byte [fs_found], 1
+    call fs_disable_slot
+    clc
+    ret
+.io_err:
+    mov rsi, fs_xfer_err_msg
+    call print_string
+    mov al, ASCII_CR
+    call print_char
+    mov byte [fs_found], 1           ; device present but unusable: stop scan
+    call fs_disable_slot
+    clc
+    ret
+.fs_err:
+    mov rsi, fs_no_fat_msg
+    call print_string
+    mov al, ASCII_CR
+    call print_char
+    mov byte [fs_found], 1
+    call fs_disable_slot
+    clc
+    ret
+.disable:
+    call fs_disable_slot
+.fail:
+    stc
+    ret
+
+; --- "ls"/"dir" handler: scan PCI for xHCI controllers and list the root
+; directory of the first FAT-formatted USB mass-storage device found. ---
+cmd_ls:
+    push rbx
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    mov byte [fs_found], 0
+    xor r12, r12                     ; r12b = bus
+.bus_loop:
+    xor r13, r13                     ; r13b = dev
+.dev_loop:
+    xor r14, r14                     ; r14b = func
+.func_loop:
+    mov cl, 0x00
+    call pci_read32
+    cmp eax, 0xFFFFFFFF
+    je .next_func
+    mov cl, 0x08
+    call pci_read32
+    shr eax, 8
+    cmp eax, 0x0C0330                ; class 0C / subclass 03 / prog-if 30: xHCI
+    jne .next_func
+    mov cl, 0x10
+    call pci_read32
+    mov ebx, eax
+    and ebx, 0x6                     ; BAR0 memory type bits
+    cmp ebx, 0x4                     ; 64-bit BAR
+    jne .bar_low
+    mov cl, 0x14
+    call pci_read32
+    test eax, eax
+    jnz .next_func                   ; BAR above 4GB - unsupported
+.bar_low:
+    mov cl, 0x10
+    call pci_read32
+    and eax, 0xFFFFFFF0
+    cmp eax, IDENTITY_MAP_LIMIT
+    jb .mmio_ok
+    cmp eax, MMIO_HIGH_BASE
+    jb .next_func
+    cmp eax, MMIO_HIGH_LIMIT - 1
+    ja .next_func
+.mmio_ok:
+    mov ebp, eax                     ; rbp = capability register base
+    mov cl, 0x04
+    call pci_read32
+    or eax, 0x06                     ; Memory Space + Bus Master
+    mov cl, 0x04
+    call pci_write32
+    push r12
+    push r13
+    push r14
+    call xhci_controller_init
+    jc .ctl_done
+    xor ebp, ebp                     ; ebp = port index
+.port_loop:
+    cmp ebp, r14d
+    jae .ctl_done
+    call fs_try_port
+    jnc .ctl_done                    ; handled (or reported) - stop
+    inc ebp
+    jmp .port_loop
+.ctl_done:
+    pop r14
+    pop r13
+    pop r12
+    cmp byte [fs_found], 0
+    jne .done
+.next_func:
+    inc r14b
+    cmp r14b, 8
+    jb .func_loop
+    inc r13b
+    cmp r13b, 32
+    jb .dev_loop
+    inc r12b
+    or r12b, r12b
+    jnz .bus_loop
+    cmp byte [fs_found], 0
+    jne .done
+    mov rsi, fs_no_dev_msg
+    call print_string
+    mov al, ASCII_CR
+    call print_char
+.done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rbx
+    ret
