@@ -155,6 +155,6 @@ xhci_dbg_timeout_msg db "  event wait timeout", 0
 
 fs_no_dev_msg db "No USB mass-storage device found.", 0
 fs_xfer_err_msg db "USB storage transfer error.", 0
-fs_no_fat_msg db "No FAT/exFAT filesystem found on the USB device.", 0
+fs_no_fat_msg db "No FAT/exFAT/NTFS filesystem found on the USB device.", 0
 fs_dir_tag_msg db "<DIR>", 0
 

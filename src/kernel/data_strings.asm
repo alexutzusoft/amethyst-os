@@ -164,6 +164,13 @@ fs_ex_active db 0
 fs_ex_size dd 0
 fs_gpt_ent_lba dd 0
 fs_gpt_left dd 0
+fs_is_ntfs db 0
+fs_mft_lba dd 0
+fs_rec_secs dd 0
+fs_indx_secs dd 0
+fs_run_ptr dd 0
+fs_run_lcn dd 0
+fs_run_len dd 0
 fs_fat_cached dd 0
 fs_name_len dd 0
 fs_entry_off dd 0

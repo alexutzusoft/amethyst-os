@@ -436,6 +436,7 @@ fs_mount:
     push rbx
     mov dword [fs_part_lba], 0
     mov byte [fs_is_exfat], 0
+    mov byte [fs_is_ntfs], 0
     mov dword [fs_fat_cached], 0xFFFFFFFF
     xor eax, eax
     mov edi, FS_SECTOR_BUF
@@ -521,6 +522,9 @@ fs_mount:
     sub dword [fs_gpt_left], 4
     jmp .gpt_sec
 .parse:
+    mov rax, 0x202020205346544E          ; "NTFS    "
+    cmp [FS_SECTOR_BUF + 3], rax
+    je .ntfs
     mov rax, 0x2020205441465845          ; "EXFAT   "
     cmp [FS_SECTOR_BUF + 3], rax
     je .exfat
@@ -579,6 +583,65 @@ fs_mount:
     mov byte [fs_is_exfat], 1
     mov byte [fs_ex_active], 0
     jmp .done
+.ntfs:
+    cmp word [FS_SECTOR_BUF + 11], 512   ; bytes/sector
+    jne .fail
+    movzx eax, byte [FS_SECTOR_BUF + 13] ; sectors/cluster
+    test eax, eax
+    jz .fail
+    mov [fs_spc], eax
+    mov eax, [FS_SECTOR_BUF + 48]        ; MFT start cluster (low dword)
+    imul eax, [fs_spc]
+    add eax, [fs_part_lba]
+    mov [fs_mft_lba], eax
+    ; file record size (byte 64): >0 = clusters, <0 = 2^-n bytes
+    movsx eax, byte [FS_SECTOR_BUF + 64]
+    test eax, eax
+    jns .rec_clusters
+    neg eax
+    mov ecx, eax
+    mov eax, 1
+    shl eax, cl                          ; bytes per record
+    shr eax, 9                           ; -> sectors
+    jmp .rec_have
+.rec_clusters:
+    imul eax, [fs_spc]
+.rec_have:
+    test eax, eax
+    jnz .rec_ok
+    mov eax, 1
+.rec_ok:
+    cmp eax, 16
+    jbe .rec_cap
+    mov eax, 16
+.rec_cap:
+    mov [fs_rec_secs], eax
+    ; index block size (byte 68): same encoding
+    movsx eax, byte [FS_SECTOR_BUF + 68]
+    test eax, eax
+    jns .idx_clusters
+    neg eax
+    mov ecx, eax
+    mov eax, 1
+    shl eax, cl
+    shr eax, 9
+    jmp .idx_have
+.idx_clusters:
+    imul eax, [fs_spc]
+.idx_have:
+    test eax, eax
+    jnz .idx_ok
+    mov eax, 1
+.idx_ok:
+    cmp eax, 16
+    jbe .idx_cap
+    mov eax, 16
+.idx_cap:
+    mov [fs_indx_secs], eax
+    mov byte [fs_is_fat32], 0
+    mov byte [fs_is_exfat], 0
+    mov byte [fs_is_ntfs], 1
+    jmp .done
 .fail:
     pop rbx
     stc
@@ -592,6 +655,9 @@ fs_is_vbr:
     jne .no
 .chk:
     mov rax, 0x2020205441465845          ; "EXFAT   "
+    cmp [FS_SECTOR_BUF + 3], rax
+    je .yes
+    mov rax, 0x202020205346544E          ; "NTFS    "
     cmp [FS_SECTOR_BUF + 3], rax
     je .yes
     cmp word [FS_SECTOR_BUF + 11], 512
@@ -609,6 +675,8 @@ fs_is_vbr:
 ; fixed root region; FAT32/exFAT: follow the root cluster chain through the
 ; FAT. CF set on read error. ---
 fs_list_root:
+    cmp byte [fs_is_ntfs], 0
+    jne fs_ntfs_list
     cmp byte [fs_is_exfat], 0
     jne .fat32
     cmp byte [fs_is_fat32], 0
@@ -841,6 +909,364 @@ fs_print_entry:
 .cr:
     mov al, ASCII_CR
     call print_char
+    ret
+
+; --- Read fs_rec_secs sectors starting at LBA eax into buffer edi. ---
+fs_read_run:
+    push rcx
+    push rsi
+    mov ecx, [fs_rec_secs]
+    mov esi, eax
+.rr_loop:
+    push rcx
+    push rsi
+    push rdi
+    mov eax, esi
+    call fs_read_sector
+    pop rdi
+    pop rsi
+    pop rcx
+    jc .rr_fail
+    inc esi
+    add edi, 512
+    dec ecx
+    jnz .rr_loop
+    pop rsi
+    pop rcx
+    clc
+    ret
+.rr_fail:
+    pop rsi
+    pop rcx
+    stc
+    ret
+
+; --- Read edx sectors starting at LBA eax into buffer edi (INDX blocks). ---
+fs_read_secs:
+    push rcx
+    push rsi
+    mov ecx, edx
+    mov esi, eax
+.rs_loop:
+    push rcx
+    push rsi
+    push rdi
+    mov eax, esi
+    call fs_read_sector
+    pop rdi
+    pop rsi
+    pop rcx
+    jc .rs_fail
+    inc esi
+    add edi, 512
+    dec ecx
+    jnz .rs_loop
+    pop rsi
+    pop rcx
+    clc
+    ret
+.rs_fail:
+    pop rsi
+    pop rcx
+    stc
+    ret
+
+; --- Apply the NTFS update-sequence-array fixup to the record at edi,
+; spanning ecx 512-byte sectors: restore the last word of each sector from
+; the USA following the record header. ---
+fs_apply_fixup:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    movzx eax, word [rdi + 4]        ; USA offset
+    movzx ecx, word [rdi + 6]        ; USA count (fixup word + one per sector)
+    lea rsi, [rdi + rax]             ; rsi -> USA
+    add rsi, 2                       ; skip the check value
+    mov edx, 0                      ; sector index
+.fx_loop:
+    dec ecx                          ; entries after the check value
+    cmp ecx, 0
+    jle .fx_done
+    mov eax, edx
+    shl eax, 9
+    add eax, 510                     ; last word of this sector
+    mov bx, [rsi]
+    mov [rdi + rax], bx
+    add rsi, 2
+    inc edx
+    jmp .fx_loop
+.fx_done:
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; --- List the NTFS root directory (MFT record 5). Reads the record, applies
+; fixups, then walks INDEX_ROOT and any INDEX_ALLOCATION runs. CF on error. ---
+fs_ntfs_list:
+    mov eax, 5                       ; MFT record 5 = root directory
+    imul eax, [fs_rec_secs]
+    add eax, [fs_mft_lba]
+    mov edi, FS_MFT_BUF
+    call fs_read_run
+    jc .fail
+    cmp dword [FS_MFT_BUF], 0x454C4946   ; "FILE"
+    jne .fail
+    mov edi, FS_MFT_BUF
+    mov ecx, [fs_rec_secs]
+    call fs_apply_fixup
+    ; walk attributes for INDEX_ROOT (0x90) and INDEX_ALLOCATION (0xA0)
+    movzx edx, word [FS_MFT_BUF + 20]    ; first attribute offset
+.attr_loop:
+    mov eax, edx
+    cmp eax, 4096
+    jae .no_root
+    mov eax, [FS_MFT_BUF + rdx]           ; attribute type
+    cmp eax, 0xFFFFFFFF
+    je .no_root
+    cmp eax, 0x90
+    je .found_root
+    mov eax, [FS_MFT_BUF + rdx + 4]       ; attribute length
+    test eax, eax
+    jz .no_root
+    add edx, eax
+    jmp .attr_loop
+.found_root:
+    ; resident: value at [attr + valueOffset(0x14 word)]
+    movzx eax, word [FS_MFT_BUF + rdx + 0x14]
+    add eax, edx
+    lea rsi, [FS_MFT_BUF + rax]           ; rsi -> INDEX_ROOT
+    ; INDEX_NODE_HEADER at rsi+16; entries at +[hdr+0]
+    mov eax, [rsi + 16]                   ; first entry offset (rel to node hdr)
+    lea rbx, [rsi + 16]
+    add rbx, rax                          ; rbx -> first index entry
+    mov rsi, rbx
+    call fs_ntfs_walk
+    ; INDEX_ALLOCATION present? node header flags bit 0
+.check_alloc:
+    ; re-scan attributes for 0xA0
+    movzx edx, word [FS_MFT_BUF + 20]
+.alloc_scan:
+    mov eax, edx
+    cmp eax, 4096
+    jae .done
+    mov eax, [FS_MFT_BUF + rdx]
+    cmp eax, 0xFFFFFFFF
+    je .done
+    cmp eax, 0xA0
+    je .found_alloc
+    mov eax, [FS_MFT_BUF + rdx + 4]
+    test eax, eax
+    jz .done
+    add edx, eax
+    jmp .alloc_scan
+.found_alloc:
+    ; non-resident: data runs at [attr + runsOffset(0x20 word)]
+    movzx eax, word [FS_MFT_BUF + rdx + 0x20]
+    add eax, edx
+    mov [fs_run_ptr], eax
+    mov dword [fs_run_lcn], 0
+.run_loop:
+    mov eax, [fs_run_ptr]
+    movzx ecx, byte [FS_MFT_BUF + rax]    ; run header
+    test cl, cl
+    jz .done                              ; end of runs
+    inc eax
+    mov ebx, ecx
+    and ebx, 0x0F                         ; length field size
+    mov edx, ecx
+    shr edx, 4                            ; offset field size
+    ; read run length (little-endian, ebx bytes)
+    ; (r10-r15/rbp hold live xHCI state - use esi/edi as scratch here)
+    xor r8d, r8d
+    xor r9d, r9d                          ; shift
+.len_bytes:
+    test ebx, ebx
+    jz .len_done
+    movzx ecx, byte [FS_MFT_BUF + rax]
+    mov esi, ecx
+    mov ecx, r9d
+    shl esi, cl
+    or r8d, esi
+    add r9d, 8
+    inc eax
+    dec ebx
+    jmp .len_bytes
+.len_done:
+    mov [fs_run_len], r8d
+    ; read run offset (signed, edx bytes)
+    xor r8d, r8d
+    xor r9d, r9d
+    mov edi, edx                          ; keep count for sign extension
+.off_bytes:
+    test edx, edx
+    jz .off_done
+    movzx ecx, byte [FS_MFT_BUF + rax]
+    mov esi, ecx
+    mov ecx, r9d
+    shl esi, cl
+    or r8d, esi
+    add r9d, 8
+    inc eax
+    dec edx
+    jmp .off_bytes
+.off_done:
+    ; sign-extend r8d from (edi*8) bits
+    test edi, edi
+    jz .after_run                         ; sparse (no offset) - skip
+    mov ecx, edi
+    shl ecx, 3
+    cmp ecx, 32
+    jae .no_sext
+    mov edx, 1
+    dec ecx
+    shl edx, cl                           ; sign bit mask
+    test r8d, edx
+    jz .no_sext
+    mov ecx, edi
+    shl ecx, 3
+    mov edx, 0xFFFFFFFF
+    shl edx, cl
+    or r8d, edx                           ; sign bits set
+.no_sext:
+    mov [fs_run_ptr], eax                 ; advance past this run header
+    add [fs_run_lcn], r8d                 ; LCN += delta
+    ; read each index block of this run (fs_run_len clusters remain)
+.blk_loop:
+    cmp dword [fs_run_len], 0
+    jle .run_loop
+    mov eax, [fs_run_lcn]
+    imul eax, [fs_spc]
+    add eax, [fs_part_lba]
+    mov edi, FS_INDX_BUF
+    mov edx, [fs_indx_secs]
+    call fs_read_secs
+    jc .fail
+    cmp dword [FS_INDX_BUF], 0x58444E49    ; "INDX"
+    jne .blk_next
+    mov edi, FS_INDX_BUF
+    mov ecx, [fs_indx_secs]
+    call fs_apply_fixup
+    mov eax, [FS_INDX_BUF + 24]           ; first entry offset (rel to +24)
+    lea rsi, [FS_INDX_BUF + 24]
+    add rsi, rax
+    call fs_ntfs_walk
+.blk_next:
+    ; advance LCN by clusters-per-index-block, decrement remaining
+    mov eax, [fs_indx_secs]
+    xor edx, edx
+    div dword [fs_spc]                    ; clusters per INDX block
+    test eax, eax
+    jnz .have_cpb
+    mov eax, 1
+.have_cpb:
+    add [fs_run_lcn], eax
+    sub [fs_run_len], eax
+    jmp .blk_loop
+.after_run:
+    mov [fs_run_ptr], eax
+    jmp .run_loop
+.no_root:
+.done:
+    clc
+    ret
+.fail:
+    stc
+    ret
+
+; --- Walk a chain of NTFS index entries starting at rsi; print each real
+; FILE_NAME (skip system files, DOS-namespace and sub-node pointers). Stops
+; at the entry whose flags bit 1 (last) is set. ---
+fs_ntfs_walk:
+    push rbx
+    push r12
+    mov r12d, 512                    ; safety bound on entries
+.walk_loop:
+    dec r12d
+    jz .walk_done
+    ; entry: fileRef(8) length(2 @8) keyLen(2 @10) flags(2 @12)
+    movzx ebx, word [rsi + 12]       ; flags
+    test bl, 0x02                    ; last entry
+    jnz .walk_done
+    movzx eax, word [rsi + 10]       ; key (FILE_NAME) length
+    test eax, eax
+    jz .walk_next
+    ; FILE_NAME key starts at rsi+16; MFT ref of parent at +0
+    ; namespace at key+0x41, name length (chars) at key+0x40, name at +0x42
+    mov rax, [rsi]                   ; file reference (low 6 bytes = record #)
+    shl rax, 16
+    shr rax, 16
+    cmp rax, 16                      ; system files occupy records 0..15
+    jb .walk_next
+    movzx eax, byte [rsi + 16 + 0x41]  ; namespace
+    cmp al, 2                        ; DOS-only name -> skip (dup)
+    je .walk_next
+    call fs_ntfs_print
+.walk_next:
+    movzx eax, word [rsi + 8]        ; entry length
+    test eax, eax
+    jz .walk_done
+    add rsi, rax
+    jmp .walk_loop
+.walk_done:
+    pop r12
+    pop rbx
+    ret
+
+; --- Print one NTFS index entry at rsi: FILE_NAME name, padded, then
+; "<DIR>" or the real file size. ---
+fs_ntfs_print:
+    push rsi
+    push r12
+    mov dword [fs_name_len], 0
+    movzx r12d, byte [rsi + 16 + 0x40]  ; name length in UTF-16 chars
+    lea rbx, [rsi + 16 + 0x42]          ; name
+    xor ecx, ecx
+.name_loop:
+    cmp ecx, r12d
+    jae .name_done
+    mov ax, [rbx + rcx*2]
+    cmp ax, 0x7F
+    jbe .ch_ok
+    mov ax, '?'
+.ch_ok:
+    push rcx
+    push rbx
+    call print_char
+    pop rbx
+    pop rcx
+    inc dword [fs_name_len]
+    inc ecx
+    jmp .name_loop
+.name_done:
+.pad_loop:
+    cmp dword [fs_name_len], 14
+    jae .pad_done
+    mov al, ' '
+    call print_char
+    inc dword [fs_name_len]
+    jmp .pad_loop
+.pad_done:
+    mov eax, [rsi + 16 + 0x38]          ; file attribute flags (low dword)
+    test eax, 0x10000000                ; directory (index present)
+    jnz .dir
+    test eax, 0x10                      ; FILE_ATTRIBUTE_DIRECTORY
+    jnz .dir
+    mov eax, [rsi + 16 + 0x30]          ; real size (low dword)
+    call print_dec64
+    jmp .cr
+.dir:
+    mov rsi, fs_dir_tag_msg
+    call print_string
+.cr:
+    mov al, ASCII_CR
+    call print_char
+    pop r12
+    pop rsi
     ret
 
 ; --- Bring up the device on port ebp and, if it is a bulk-only

@@ -87,6 +87,8 @@ FS_CBW           equ FS_SCRATCH_BASE + 0x2000   ; 31-byte command block wrapper
 FS_CSW           equ FS_SCRATCH_BASE + 0x2040   ; 13-byte command status wrapper
 FS_SECTOR_BUF    equ FS_SCRATCH_BASE + 0x3000   ; 512-byte sector reads (MBR/VBR/dir)
 FS_FAT_BUF       equ FS_SCRATCH_BASE + 0x3400   ; 512-byte cached FAT sector (FAT32 chains)
+FS_MFT_BUF       equ FS_SCRATCH_BASE + 0x4000   ; NTFS MFT file record (up to 8 sectors)
+FS_INDX_BUF      equ FS_SCRATCH_BASE + 0x6000   ; NTFS INDX index block (up to 16 sectors)
 
 ; --- BIOS memory map captured by stage1.asm's detect_memory (real mode,
 ; before the switch to protected/long mode - BIOS interrupts aren't
