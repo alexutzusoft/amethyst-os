@@ -40,7 +40,7 @@ cp build/BOOTX64.EFI build/iso/EFI/BOOT/BOOTX64.EFI
 # which looks for a file literally named isolinux.bin and fails outright
 # against our own boot.bin - see build/amethyst-os.img below instead.) ---
 xorriso -as mkisofs -o build/amethyst-os.iso \
-    -b boot.bin -no-emul-boot -boot-load-size 128 \
+    -b boot.bin -no-emul-boot -boot-load-size 256 \
     -eltorito-alt-boot \
     -e esp.img -no-emul-boot \
     build/iso

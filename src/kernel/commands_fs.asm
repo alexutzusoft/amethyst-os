@@ -1046,6 +1046,10 @@ fs_ntfs_list:
     add rbx, rax                          ; rbx -> first index entry
     mov rsi, rbx
     call fs_ntfs_walk
+    cmp byte [fs_action], 0
+    je .check_alloc
+    cmp byte [fs_cat_found], 0
+    jne .done                             ; cat found its match in the root
     ; INDEX_ALLOCATION present? node header flags bit 0
 .check_alloc:
     ; re-scan attributes for 0xA0
@@ -1155,6 +1159,10 @@ fs_ntfs_list:
     lea rsi, [FS_INDX_BUF + 24]
     add rsi, rax
     call fs_ntfs_walk
+    cmp byte [fs_action], 0
+    je .blk_next
+    cmp byte [fs_cat_found], 0
+    jne .done                             ; cat found its match in this block
 .blk_next:
     ; advance LCN by clusters-per-index-block, decrement remaining
     mov eax, [fs_indx_secs]
@@ -1202,9 +1210,17 @@ fs_ntfs_walk:
     shr rax, 16
     cmp rax, 16                      ; system files occupy records 0..15
     jb .walk_next
+    mov [fs_cat_ntfs_ref], eax       ; stash record # in case cat matches it
     movzx eax, byte [rsi + 16 + 0x41]  ; namespace
     cmp al, 2                        ; DOS-only name -> skip (dup)
     je .walk_next
+    cmp byte [fs_action], 0
+    je .do_print
+    call fs_ntfs_match
+    cmp byte [fs_cat_found], 0
+    jne .walk_done
+    jmp .walk_next
+.do_print:
     call fs_ntfs_print
 .walk_next:
     movzx eax, word [rsi + 8]        ; entry length
@@ -1215,6 +1231,59 @@ fs_ntfs_walk:
 .walk_done:
     pop r12
     pop rbx
+    ret
+
+; --- Compare one NTFS index entry's FILE_NAME at rsi against fs_target_raw
+; (case-folded the same way fs_ntfs_print folds for display). On a match
+; against a non-directory entry, sets fs_cat_found=1 and fs_cat_size (real
+; size); fs_cat_ntfs_ref was already stashed by fs_ntfs_walk. ---
+fs_ntfs_match:
+    push rsi
+    push rbx
+    push rcx
+    push rdx
+    push r8
+    push r9
+    movzx ecx, byte [rsi + 16 + 0x40]   ; name length in UTF-16 chars
+    lea rbx, [rsi + 16 + 0x42]          ; name
+    cmp ecx, [fs_target_raw_len]
+    jne .no_match
+    lea r9, [fs_target_raw]
+    xor edx, edx
+.cmp_loop:
+    cmp edx, ecx
+    jae .name_ok
+    mov ax, [rbx + rdx*2]
+    cmp ax, 0x7F
+    jbe .ch_ok
+    mov al, '?'
+.ch_ok:
+    cmp al, 'a'
+    jb .ch_have
+    cmp al, 'z'
+    ja .ch_have
+    sub al, 0x20
+.ch_have:
+    cmp al, [r9 + rdx]
+    jne .no_match
+    inc edx
+    jmp .cmp_loop
+.name_ok:
+    mov eax, [rsi + 16 + 0x38]          ; file attribute flags (low dword)
+    test eax, 0x10000000                ; directory (index present)
+    jnz .no_match
+    test eax, 0x10                      ; FILE_ATTRIBUTE_DIRECTORY
+    jnz .no_match
+    mov eax, [rsi + 16 + 0x30]          ; real size (low dword)
+    mov [fs_cat_size], eax
+    mov byte [fs_cat_found], 1
+.no_match:
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rsi
     ret
 
 ; --- Print one NTFS index entry at rsi: FILE_NAME name, padded, then
@@ -1430,7 +1499,13 @@ fs_try_port:
 .ready:
     call fs_mount
     jc .fs_err
+    cmp byte [fs_action], 0
+    jne .do_cat
     call fs_list_root
+    jmp .listed
+.do_cat:
+    call fs_cat_root
+.listed:
     jc .io_err
     mov byte [fs_found], 1
     call fs_disable_slot
@@ -1460,9 +1535,29 @@ fs_try_port:
     stc
     ret
 
-; --- "ls"/"dir" handler: scan PCI for xHCI controllers and list the root
-; directory of the first FAT-formatted USB mass-storage device found. ---
+; --- "ls"/"cat" shared handler: scan PCI for xHCI controllers and, on the
+; first FAT-formatted USB mass-storage device found, either list the root
+; directory or cat a file, per fs_action (0 = list, 1 = cat). ---
 cmd_ls:
+    mov byte [fs_action], 0
+    jmp fs_scan_devices
+
+; --- "cat <filename>" handler: rsi -> nul-terminated filename argument. ---
+cmd_cat:
+    mov al, [rsi]
+    or al, al
+    jz .usage
+    call fs_build_target_name
+    mov byte [fs_action], 1
+    jmp fs_scan_devices
+.usage:
+    mov rsi, cat_usage_msg
+    call print_string
+    mov al, ASCII_CR
+    call print_char
+    ret
+
+fs_scan_devices:
     push rbx
     push rbp
     push r8
@@ -1562,4 +1657,672 @@ cmd_ls:
     pop r8
     pop rbp
     pop rbx
+    ret
+
+; --- Build the two forms of the filename cat is looking for, from the
+; nul/space-terminated argument at rsi: the 11-byte 8.3 padded, uppercased
+; name in fs_target_name (FAT12/16/32), and the plain uppercased name (no
+; padding, dot kept) in fs_target_raw/fs_target_raw_len (exFAT). ---
+fs_build_target_name:
+    push rax
+    push rbx
+    push rcx
+    push rdi
+    push rsi
+    xor ebx, ebx
+    lea rdi, [fs_target_raw]
+.raw_loop:
+    mov al, [rsi]
+    or al, al
+    jz .raw_done
+    cmp al, ' '
+    je .raw_done
+    cmp ebx, 255
+    jae .raw_done
+    cmp al, 'a'
+    jb .raw_store
+    cmp al, 'z'
+    ja .raw_store
+    sub al, 0x20
+.raw_store:
+    mov [rdi + rbx], al
+    inc ebx
+    inc rsi
+    jmp .raw_loop
+.raw_done:
+    mov [fs_target_raw_len], ebx
+    pop rsi
+    lea rdi, [fs_target_name]
+    mov ecx, 11
+    mov al, ' '
+.clear:
+    mov [rdi], al
+    inc rdi
+    dec ecx
+    jnz .clear
+    lea rdi, [fs_target_name]
+    xor ecx, ecx
+.name_loop:
+    mov al, [rsi]
+    or al, al
+    jz .done
+    cmp al, ' '
+    je .done
+    cmp al, '.'
+    je .ext
+    cmp ecx, 8
+    jae .skip_char
+    cmp al, 'a'
+    jb .store
+    cmp al, 'z'
+    ja .store
+    sub al, 0x20
+.store:
+    mov [rdi + rcx], al
+    inc ecx
+.skip_char:
+    inc rsi
+    jmp .name_loop
+.ext:
+    inc rsi
+    xor ecx, ecx
+.ext_loop:
+    mov al, [rsi]
+    or al, al
+    jz .done
+    cmp al, ' '
+    je .done
+    cmp ecx, 3
+    jae .ext_skip
+    cmp al, 'a'
+    jb .ext_store
+    cmp al, 'z'
+    ja .ext_store
+    sub al, 0x20
+.ext_store:
+    mov [rdi + 8 + rcx], al
+    inc ecx
+.ext_skip:
+    inc rsi
+    jmp .ext_loop
+.done:
+    pop rdi
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; --- Find fs_target_name/fs_target_raw in the mounted volume's root
+; directory (FAT12/16/32, exFAT or NTFS) and cat its contents. CF set on
+; read error. ---
+fs_cat_root:
+    mov byte [fs_cat_found], 0
+    cmp byte [fs_is_ntfs], 0
+    jne .ntfs
+    cmp byte [fs_is_exfat], 0
+    jne .fat32
+    cmp byte [fs_is_fat32], 0
+    jne .fat32
+    mov eax, [fs_root_lba]
+    mov [fs_cur_lba], eax
+    mov eax, [fs_root_secs]
+    mov [fs_sec_count], eax
+.f16_loop:
+    cmp dword [fs_sec_count], 0
+    je .search_done
+    mov eax, [fs_cur_lba]
+    mov edi, FS_SECTOR_BUF
+    call fs_read_sector
+    jc .fail
+    call fs_cat_sector
+    jc .search_done
+    inc dword [fs_cur_lba]
+    dec dword [fs_sec_count]
+    jmp .f16_loop
+.fat32:
+.clus_loop:
+    mov eax, [fs_cur_cluster]
+    cmp eax, 2
+    jb .search_done
+    cmp eax, 0x0FFFFFF8
+    jae .search_done
+    sub eax, 2
+    imul eax, [fs_spc]
+    add eax, [fs_data_lba]
+    mov [fs_cur_lba], eax
+    mov eax, [fs_spc]
+    mov [fs_sec_count], eax
+.f32_sec_loop:
+    cmp dword [fs_sec_count], 0
+    je .next_clus
+    mov eax, [fs_cur_lba]
+    mov edi, FS_SECTOR_BUF
+    call fs_read_sector
+    jc .fail
+    cmp byte [fs_is_exfat], 0
+    jne .call_exfat
+    call fs_cat_sector
+    jmp .call_done
+.call_exfat:
+    call fs_cat_sector_exfat
+.call_done:
+    jc .search_done
+    inc dword [fs_cur_lba]
+    dec dword [fs_sec_count]
+    jmp .f32_sec_loop
+.next_clus:
+    mov eax, [fs_cur_cluster]
+    shr eax, 7
+    add eax, [fs_fat_lba]
+    cmp eax, [fs_fat_cached]
+    je .cached
+    mov [fs_fat_cached], eax
+    mov edi, FS_FAT_BUF
+    call fs_read_sector
+    jnc .cached
+    mov dword [fs_fat_cached], 0xFFFFFFFF
+    jmp .fail
+.cached:
+    mov eax, [fs_cur_cluster]
+    and eax, 127
+    mov eax, [FS_FAT_BUF + rax*4]
+    cmp byte [fs_is_exfat], 0
+    jne .no_mask
+    and eax, 0x0FFFFFFF
+.no_mask:
+    mov [fs_cur_cluster], eax
+    jmp .clus_loop
+.search_done:
+    cmp byte [fs_cat_found], 0
+    jne .found
+    mov rsi, fs_cat_notfound_msg
+    call print_string
+    mov al, ASCII_CR
+    call print_char
+    clc
+    ret
+.found:
+    mov eax, [fs_cat_cluster]
+    mov ecx, [fs_cat_size]
+    call fs_cat_data
+    clc
+    ret
+.fail:
+    stc
+    ret
+.ntfs:
+    call fs_ntfs_list                ; fs_action=1: matches by name instead of printing
+    jc .fail
+    cmp byte [fs_cat_found], 0
+    jne .ntfs_found
+    mov rsi, fs_cat_notfound_msg
+    call print_string
+    mov al, ASCII_CR
+    call print_char
+    clc
+    ret
+.ntfs_found:
+    call fs_cat_ntfs_data
+    clc
+    ret
+
+; --- Scan the 16 directory entries in FS_SECTOR_BUF for fs_target_name.
+; CF set to stop the caller's scan, either because a matching file entry
+; was found (fs_cat_found=1, fs_cat_cluster/fs_cat_size filled) or the
+; 0x00 end-of-directory marker was hit (fs_cat_found stays 0). ---
+fs_cat_sector:
+    mov dword [fs_entry_off], 0
+.loop:
+    mov eax, [fs_entry_off]
+    cmp eax, 512
+    jae .not_end
+    mov esi, FS_SECTOR_BUF
+    add esi, eax
+    mov al, [rsi]
+    test al, al
+    jz .end_marker
+    cmp al, 0xE5                     ; deleted
+    je .skip
+    mov al, [rsi + 11]
+    test al, 0x08                    ; volume label / LFN entry
+    jnz .skip
+    push rcx
+    push rdi
+    push rsi
+    lea rdi, [fs_target_name]
+    mov rcx, 11
+    repe cmpsb
+    pop rsi
+    pop rdi
+    pop rcx
+    jne .skip
+    mov al, [rsi + 11]
+    test al, 0x10                    ; directory: cat doesn't support this
+    jnz .skip
+    movzx eax, word [rsi + 26]       ; first cluster, low word
+    mov ecx, eax
+    movzx eax, word [rsi + 20]       ; first cluster, high word (FAT32)
+    shl eax, 16
+    or eax, ecx
+    mov [fs_cat_cluster], eax
+    mov eax, [rsi + 28]              ; file size
+    mov [fs_cat_size], eax
+    mov byte [fs_cat_found], 1
+    stc
+    ret
+.skip:
+    add dword [fs_entry_off], 32
+    jmp .loop
+.not_end:
+    clc
+    ret
+.end_marker:
+    stc
+    ret
+
+; --- Scan the exFAT directory entries in FS_SECTOR_BUF for fs_target_raw
+; (accumulating each file's UTF-16 name, ASCII-folded and uppercased, into
+; fs_ex_name_buf the same way fs_list_sector does for printing). Same CF
+; convention as fs_cat_sector. ---
+fs_cat_sector_exfat:
+    mov dword [fs_entry_off], 0
+.loop:
+    mov eax, [fs_entry_off]
+    cmp eax, 512
+    jae .not_end
+    mov esi, FS_SECTOR_BUF
+    add esi, eax
+    mov al, [rsi]
+    test al, al
+    jz .end_marker
+    cmp al, 0x85                     ; file directory entry
+    jne .ex_not_file
+    mov al, [rsi + 4]                ; file attributes (low byte)
+    mov [fs_ex_attr], al
+    mov al, [rsi + 1]                ; secondary count
+    mov [fs_ex_nrem], al
+    mov byte [fs_ex_active], 1
+    mov dword [fs_ex_size], 0
+    mov dword [fs_name_len], 0
+    jmp .skip
+.ex_not_file:
+    cmp byte [fs_ex_active], 0
+    je .skip
+    cmp al, 0xC0                     ; stream extension entry
+    jne .ex_not_stream
+    mov eax, [rsi + 20]              ; first cluster
+    mov [fs_cat_cluster], eax
+    mov eax, [rsi + 24]              ; data length (low dword)
+    mov [fs_cat_size], eax
+    jmp .ex_sec_done
+.ex_not_stream:
+    cmp al, 0xC1                     ; file name entry
+    jne .ex_sec_done
+    xor ecx, ecx
+.ex_name_loop:
+    cmp ecx, 15
+    jae .ex_sec_done
+    mov ax, [rsi + 2 + rcx*2]        ; UTF-16 char
+    test ax, ax
+    jz .ex_sec_done
+    cmp ax, 0x7F
+    jbe .ex_ch_ok
+    mov al, '?'
+.ex_ch_ok:
+    cmp al, 'a'
+    jb .ex_ch_store
+    cmp al, 'z'
+    ja .ex_ch_store
+    sub al, 0x20
+.ex_ch_store:
+    mov ebx, [fs_name_len]
+    cmp ebx, 255
+    jae .ex_name_skip
+    lea rdi, [fs_ex_name_buf]
+    mov [rdi + rbx], al
+.ex_name_skip:
+    inc dword [fs_name_len]
+    inc ecx
+    jmp .ex_name_loop
+.ex_sec_done:
+    dec byte [fs_ex_nrem]
+    jnz .skip
+    mov byte [fs_ex_active], 0
+    mov eax, [fs_name_len]
+    cmp eax, [fs_target_raw_len]
+    jne .skip
+    test byte [fs_ex_attr], 0x10     ; directory: cat doesn't support this
+    jnz .skip
+    test eax, eax
+    jz .name_match
+    push rcx
+    push rsi
+    push rdi
+    lea rsi, [fs_ex_name_buf]
+    lea rdi, [fs_target_raw]
+    mov ecx, eax
+    repe cmpsb
+    pop rdi
+    pop rsi
+    pop rcx
+    jne .skip
+.name_match:
+    mov byte [fs_cat_found], 1
+    stc
+    ret
+.skip:
+    add dword [fs_entry_off], 32
+    jmp .loop
+.not_end:
+    clc
+    ret
+.end_marker:
+    stc
+    ret
+
+; --- Print a file's contents: eax = starting cluster, ecx = size in bytes.
+; Walks the cluster chain through the FAT, reading and printing one sector
+; at a time (bare LF bytes are dropped since print_char already turns CR
+; into a newline). Stops early on a read error. ---
+fs_cat_data:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    mov [fs_cat_cluster], eax
+    mov [fs_cat_remain], ecx
+.clus_loop:
+    cmp dword [fs_cat_remain], 0
+    je .done
+    mov eax, [fs_cat_cluster]
+    cmp eax, 2
+    jb .done
+    cmp eax, 0x0FFFFFF8
+    jae .done
+    sub eax, 2
+    imul eax, [fs_spc]
+    add eax, [fs_data_lba]
+    mov [fs_cur_lba], eax
+    mov eax, [fs_spc]
+    mov [fs_sec_count], eax
+.sec_loop:
+    cmp dword [fs_sec_count], 0
+    je .next_clus
+    cmp dword [fs_cat_remain], 0
+    je .done
+    mov eax, [fs_cur_lba]
+    mov edi, FS_SECTOR_BUF
+    call fs_read_sector
+    jc .done
+    mov ecx, 512
+    cmp ecx, [fs_cat_remain]
+    jbe .have_len
+    mov ecx, [fs_cat_remain]
+.have_len:
+    sub [fs_cat_remain], ecx
+    mov esi, FS_SECTOR_BUF
+.byte_loop:
+    or ecx, ecx
+    jz .byte_done
+    mov al, [rsi]
+    cmp al, 0x0A                     ; LF: skip, CR already newlines
+    je .skip_byte
+    call print_char
+.skip_byte:
+    inc rsi
+    dec ecx
+    jmp .byte_loop
+.byte_done:
+    inc dword [fs_cur_lba]
+    dec dword [fs_sec_count]
+    jmp .sec_loop
+.next_clus:
+    mov eax, [fs_cat_cluster]
+    shr eax, 7
+    add eax, [fs_fat_lba]
+    cmp eax, [fs_fat_cached]
+    je .cached
+    mov [fs_fat_cached], eax
+    mov edi, FS_FAT_BUF
+    call fs_read_sector
+    jnc .cached
+    mov dword [fs_fat_cached], 0xFFFFFFFF
+    jmp .done
+.cached:
+    mov eax, [fs_cat_cluster]
+    and eax, 127
+    mov eax, [FS_FAT_BUF + rax*4]
+    cmp byte [fs_is_exfat], 0
+    jne .no_mask
+    and eax, 0x0FFFFFFF
+.no_mask:
+    mov [fs_cat_cluster], eax
+    jmp .clus_loop
+.done:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; --- Read the MFT record for fs_cat_ntfs_ref (found by fs_ntfs_list in cat
+; mode), locate its unnamed $DATA attribute (type 0x80), and print it -
+; resident inline, non-resident via fs_ntfs_cat_data. Reuses FS_MFT_BUF,
+; now done with the root-directory record it held. ---
+fs_cat_ntfs_data:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    mov eax, [fs_cat_ntfs_ref]
+    imul eax, [fs_rec_secs]
+    add eax, [fs_mft_lba]
+    mov edi, FS_MFT_BUF
+    call fs_read_run
+    jc .out
+    cmp dword [FS_MFT_BUF], 0x454C4946   ; "FILE"
+    jne .out
+    mov edi, FS_MFT_BUF
+    mov ecx, [fs_rec_secs]
+    call fs_apply_fixup
+    movzx edx, word [FS_MFT_BUF + 20]    ; first attribute offset
+.attr_loop:
+    mov eax, edx
+    cmp eax, 4096
+    jae .out
+    mov eax, [FS_MFT_BUF + rdx]          ; attribute type
+    cmp eax, 0xFFFFFFFF
+    je .out
+    cmp eax, 0x80                        ; $DATA
+    jne .attr_next
+    cmp byte [FS_MFT_BUF + rdx + 9], 0   ; name length: 0 = unnamed stream
+    je .found_data
+.attr_next:
+    mov eax, [FS_MFT_BUF + rdx + 4]      ; attribute length
+    test eax, eax
+    jz .out
+    add edx, eax
+    jmp .attr_loop
+.found_data:
+    cmp byte [FS_MFT_BUF + rdx + 8], 0   ; non-resident flag
+    jne .nonresident
+    ; resident: value at [attr + valueOffset(0x14 word)], length @ 0x10
+    movzx eax, word [FS_MFT_BUF + rdx + 0x14]
+    add eax, edx
+    lea rsi, [FS_MFT_BUF + rax]
+    mov eax, [FS_MFT_BUF + rdx + 0x10]
+    cmp eax, [fs_cat_size]
+    jbe .res_len_ok
+    mov eax, [fs_cat_size]
+.res_len_ok:
+    mov ecx, eax
+.res_loop:
+    or ecx, ecx
+    jz .out
+    mov al, [rsi]
+    cmp al, 0x0A                         ; LF: skip, CR already newlines
+    je .res_skip
+    call print_char
+.res_skip:
+    inc rsi
+    dec ecx
+    jmp .res_loop
+.nonresident:
+    movzx eax, word [FS_MFT_BUF + rdx + 0x20]  ; data run offset
+    add eax, edx
+    mov edi, eax
+    mov ecx, [fs_cat_size]
+    call fs_ntfs_cat_data
+.out:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; --- Print a non-resident NTFS $DATA attribute: edi = offset within
+; FS_MFT_BUF of its first data-run byte, ecx = size in bytes to print.
+; Walks the run list (same decode as fs_ntfs_list's INDEX_ALLOCATION runs)
+; but reads and prints one cluster's sectors at a time via FS_SECTOR_BUF,
+; instead of walking INDX blocks. Reuses fs_run_ptr/fs_run_lcn/fs_run_len -
+; safe here since fs_ntfs_list's own run walk is long done by this point. ---
+fs_ntfs_cat_data:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    mov [fs_run_ptr], edi
+    mov dword [fs_run_lcn], 0
+    mov [fs_cat_remain], ecx
+.run_loop:
+    cmp dword [fs_cat_remain], 0
+    je .done
+    mov eax, [fs_run_ptr]
+    movzx ecx, byte [FS_MFT_BUF + rax]   ; run header
+    test cl, cl
+    jz .done                             ; end of runs
+    inc eax
+    mov ebx, ecx
+    and ebx, 0x0F                        ; length field size
+    mov edx, ecx
+    shr edx, 4                           ; offset field size
+    xor r8d, r8d
+    xor r9d, r9d
+.len_bytes:
+    test ebx, ebx
+    jz .len_done
+    movzx ecx, byte [FS_MFT_BUF + rax]
+    mov esi, ecx
+    mov ecx, r9d
+    shl esi, cl
+    or r8d, esi
+    add r9d, 8
+    inc eax
+    dec ebx
+    jmp .len_bytes
+.len_done:
+    mov [fs_run_len], r8d
+    xor r8d, r8d
+    xor r9d, r9d
+    mov edi, edx                         ; keep count for sign extension
+.off_bytes:
+    test edx, edx
+    jz .off_done
+    movzx ecx, byte [FS_MFT_BUF + rax]
+    mov esi, ecx
+    mov ecx, r9d
+    shl esi, cl
+    or r8d, esi
+    add r9d, 8
+    inc eax
+    dec edx
+    jmp .off_bytes
+.off_done:
+    test edi, edi
+    jz .after_run                        ; sparse run: no offset - skip
+    mov ecx, edi
+    shl ecx, 3
+    cmp ecx, 32
+    jae .no_sext
+    mov edx, 1
+    dec ecx
+    shl edx, cl
+    test r8d, edx
+    jz .no_sext
+    mov ecx, edi
+    shl ecx, 3
+    mov edx, 0xFFFFFFFF
+    shl edx, cl
+    or r8d, edx
+.no_sext:
+    mov [fs_run_ptr], eax
+    add [fs_run_lcn], r8d
+.clus_loop:
+    cmp dword [fs_run_len], 0
+    jle .run_loop
+    cmp dword [fs_cat_remain], 0
+    je .done
+    mov eax, [fs_run_lcn]
+    imul eax, [fs_spc]
+    add eax, [fs_part_lba]
+    mov [fs_cur_lba], eax
+    mov eax, [fs_spc]
+    mov [fs_sec_count], eax
+.sec_loop:
+    cmp dword [fs_sec_count], 0
+    je .clus_next
+    cmp dword [fs_cat_remain], 0
+    je .done
+    mov eax, [fs_cur_lba]
+    mov edi, FS_SECTOR_BUF
+    call fs_read_sector
+    jc .done
+    mov ecx, 512
+    cmp ecx, [fs_cat_remain]
+    jbe .have_len
+    mov ecx, [fs_cat_remain]
+.have_len:
+    sub [fs_cat_remain], ecx
+    mov esi, FS_SECTOR_BUF
+.byte_loop:
+    or ecx, ecx
+    jz .byte_done
+    mov al, [rsi]
+    cmp al, 0x0A                         ; LF: skip, CR already newlines
+    je .skip_byte
+    call print_char
+.skip_byte:
+    inc rsi
+    dec ecx
+    jmp .byte_loop
+.byte_done:
+    inc dword [fs_cur_lba]
+    dec dword [fs_sec_count]
+    jmp .sec_loop
+.clus_next:
+    inc dword [fs_run_lcn]
+    dec dword [fs_run_len]
+    jmp .clus_loop
+.after_run:
+    mov [fs_run_ptr], eax
+    jmp .run_loop
+.done:
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
     ret

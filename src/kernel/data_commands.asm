@@ -22,6 +22,7 @@ command_table:
     dq usb_cmd, usb_cmd_end - usb_cmd, cmd_usb
     dq ls_cmd, ls_cmd_end - ls_cmd, cmd_ls
     dq dir_cmd, dir_cmd_end - dir_cmd, cmd_ls
+    dq cat_cmd, cat_cmd_end - cat_cmd, cmd_cat
     dq 0
 
 command_descriptions:
@@ -48,6 +49,7 @@ command_descriptions:
     dq desc_usb,      desc_usb_end - desc_usb
     dq desc_ls,       desc_ls_end - desc_ls
     dq desc_dir,      desc_dir_end - desc_dir
+    dq desc_cat,      desc_cat_end - desc_cat
 
 desc_echo db "print the given text"
 desc_echo_end:
@@ -95,6 +97,8 @@ desc_ls db "list files on the first USB drive found (FAT, read-only)"
 desc_ls_end:
 desc_dir db "same as ls"
 desc_dir_end:
+desc_cat db "print a file's contents: cat <filename> (FAT, read-only)"
+desc_cat_end:
 
 help_sep db " - ", 0
 color_usage_msg db "Usage: color <red|green|blue|yellow|white|HH>", 0
@@ -157,4 +161,6 @@ fs_no_dev_msg db "No USB mass-storage device found.", 0
 fs_xfer_err_msg db "USB storage transfer error.", 0
 fs_no_fat_msg db "No FAT/exFAT/NTFS filesystem found on the USB device.", 0
 fs_dir_tag_msg db "<DIR>", 0
+cat_usage_msg db "Usage: cat <filename>", 0
+fs_cat_notfound_msg db "cat: file not found", 0
 

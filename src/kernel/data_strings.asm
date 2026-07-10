@@ -43,6 +43,8 @@ ls_cmd db "ls"
 ls_cmd_end:
 dir_cmd db "dir"
 dir_cmd_end:
+cat_cmd db "cat"
+cat_cmd_end:
 unknown_msg db "Unknown command: ", 0
 run_bad_hex_msg db "Invalid hex byte", 0
 run_too_long_msg db "Too many bytes for exec_buffer", 0
@@ -176,6 +178,16 @@ fs_name_len dd 0
 fs_entry_off dd 0
 fs_sec_count dd 0
 fs_cur_lba dd 0
+fs_action db 0
+fs_target_name times 11 db 0
+fs_target_raw times 255 db 0
+fs_target_raw_len dd 0
+fs_ex_name_buf times 255 db 0
+fs_cat_found db 0
+fs_cat_cluster dd 0
+fs_cat_size dd 0
+fs_cat_remain dd 0
+fs_cat_ntfs_ref dd 0
 cmd_len db 0
 cmd_buffer times CMD_BUFFER_SIZE db 0
 timer_ticks dq 0
