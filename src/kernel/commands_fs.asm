@@ -435,6 +435,7 @@ fs_disable_slot:
 fs_mount:
     push rbx
     mov dword [fs_part_lba], 0
+    mov byte [fs_is_exfat], 0
     mov dword [fs_fat_cached], 0xFFFFFFFF
     xor eax, eax
     mov edi, FS_SECTOR_BUF
@@ -447,6 +448,8 @@ fs_mount:
     mov ebx, FS_SECTOR_BUF + 446
     mov ecx, 4
 .part_loop:
+    cmp byte [rbx + 4], 0xEE         ; GPT protective partition
+    je .gpt
     cmp byte [rbx + 4], 0            ; partition type
     je .part_next
     mov eax, [rbx + 8]               ; start LBA
@@ -466,7 +469,61 @@ fs_mount:
     add ebx, 16
     loop .part_loop
     jmp .fail
+; --- GPT: read the header at LBA 1, then walk partition entries (4 per
+; 512-byte sector) held in FS_FAT_BUF so the VBR read can use FS_SECTOR_BUF.
+; Scans up to 32 entries; accepts the first that parses as a VBR. ---
+.gpt:
+    mov eax, 1
+    mov edi, FS_SECTOR_BUF
+    call fs_read_sector
+    jc .fail
+    mov rax, 0x5452415020494645       ; "EFI PART"
+    cmp [FS_SECTOR_BUF + 0], rax
+    jne .fail
+    mov eax, [FS_SECTOR_BUF + 72]     ; PartitionEntryLBA (low dword)
+    mov [fs_gpt_ent_lba], eax
+    mov dword [fs_gpt_left], 32
+.gpt_sec:
+    cmp dword [fs_gpt_left], 0
+    je .fail
+    mov eax, [fs_gpt_ent_lba]
+    mov edi, FS_FAT_BUF
+    call fs_read_sector
+    jc .fail
+    xor edx, edx                      ; edx = entry index within sector
+.gpt_ent:
+    cmp edx, 4
+    jae .gpt_next_sec
+    mov eax, edx
+    shl eax, 7                        ; 128-byte entries
+    lea rbx, [FS_FAT_BUF + rax]
+    mov eax, [rbx + 0]                ; type GUID first dword
+    or eax, [rbx + 4]
+    or eax, [rbx + 8]
+    or eax, [rbx + 12]
+    jz .gpt_ent_next                  ; all-zero GUID -> unused
+    mov eax, [rbx + 32]               ; StartingLBA (low dword)
+    mov [fs_part_lba], eax
+    push rdx
+    mov edi, FS_SECTOR_BUF
+    call fs_read_sector
+    pop rdx
+    jc .fail
+    cmp word [FS_SECTOR_BUF + 510], 0xAA55
+    jne .gpt_ent_next
+    call fs_is_vbr
+    jnc .parse
+.gpt_ent_next:
+    inc edx
+    jmp .gpt_ent
+.gpt_next_sec:
+    inc dword [fs_gpt_ent_lba]
+    sub dword [fs_gpt_left], 4
+    jmp .gpt_sec
 .parse:
+    mov rax, 0x2020205441465845          ; "EXFAT   "
+    cmp [FS_SECTOR_BUF + 3], rax
+    je .exfat
     cmp word [FS_SECTOR_BUF + 11], 512   ; only 512-byte sectors supported
     jne .fail
     movzx eax, byte [FS_SECTOR_BUF + 13] ; sectors/cluster
@@ -503,22 +560,45 @@ fs_mount:
     pop rbx
     clc
     ret
+.exfat:
+    cmp byte [FS_SECTOR_BUF + 108], 9    ; 512-byte sectors only
+    jne .fail
+    movzx ecx, byte [FS_SECTOR_BUF + 109]
+    mov eax, 1
+    shl eax, cl
+    mov [fs_spc], eax
+    mov eax, [FS_SECTOR_BUF + 80]        ; FAT offset
+    add eax, [fs_part_lba]
+    mov [fs_fat_lba], eax
+    mov eax, [FS_SECTOR_BUF + 88]        ; cluster heap offset
+    add eax, [fs_part_lba]
+    mov [fs_data_lba], eax
+    mov eax, [FS_SECTOR_BUF + 96]        ; root directory first cluster
+    mov [fs_cur_cluster], eax
+    mov byte [fs_is_fat32], 0
+    mov byte [fs_is_exfat], 1
+    mov byte [fs_ex_active], 0
+    jmp .done
 .fail:
     pop rbx
     stc
     ret
 
-; --- Does FS_SECTOR_BUF look like a FAT boot sector? CF clear if yes. ---
+; --- Does FS_SECTOR_BUF look like a FAT/exFAT boot sector? CF clear if yes. ---
 fs_is_vbr:
     cmp byte [FS_SECTOR_BUF], 0xEB
     je .chk
     cmp byte [FS_SECTOR_BUF], 0xE9
     jne .no
 .chk:
+    mov rax, 0x2020205441465845          ; "EXFAT   "
+    cmp [FS_SECTOR_BUF + 3], rax
+    je .yes
     cmp word [FS_SECTOR_BUF + 11], 512
     jne .no
     cmp byte [FS_SECTOR_BUF + 13], 0
     je .no
+.yes:
     clc
     ret
 .no:
@@ -526,9 +606,11 @@ fs_is_vbr:
     ret
 
 ; --- List the root directory of the mounted volume. FAT12/16: walk the
-; fixed root region; FAT32: follow the root cluster chain through the FAT.
-; CF set on read error. ---
+; fixed root region; FAT32/exFAT: follow the root cluster chain through the
+; FAT. CF set on read error. ---
 fs_list_root:
+    cmp byte [fs_is_exfat], 0
+    jne .fat32
     cmp byte [fs_is_fat32], 0
     jne .fat32
     mov eax, [fs_root_lba]
@@ -588,7 +670,10 @@ fs_list_root:
     mov eax, [fs_cur_cluster]
     and eax, 127
     mov eax, [FS_FAT_BUF + rax*4]
+    cmp byte [fs_is_exfat], 0
+    jne .no_mask
     and eax, 0x0FFFFFFF
+.no_mask:
     mov [fs_cur_cluster], eax
     jmp .clus_loop
 .done:
@@ -609,6 +694,8 @@ fs_list_sector:
     jae .not_end
     mov esi, FS_SECTOR_BUF
     add esi, eax
+    cmp byte [fs_is_exfat], 0
+    jne .exfat
     mov al, [rsi]
     test al, al
     jz .end_marker
@@ -621,11 +708,82 @@ fs_list_sector:
 .skip:
     add dword [fs_entry_off], 32
     jmp .loop
+.exfat:
+    mov al, [rsi]
+    test al, al
+    jz .end_marker
+    cmp al, 0x85                     ; file directory entry
+    jne .ex_not_file
+    mov al, [rsi + 4]                ; file attributes (low byte)
+    mov [fs_ex_attr], al
+    mov al, [rsi + 1]                ; secondary count
+    mov [fs_ex_nrem], al
+    mov byte [fs_ex_active], 1
+    mov dword [fs_ex_size], 0
+    mov dword [fs_name_len], 0
+    jmp .skip
+.ex_not_file:
+    cmp byte [fs_ex_active], 0
+    je .skip
+    cmp al, 0xC0                     ; stream extension entry
+    jne .ex_not_stream
+    mov eax, [rsi + 24]              ; data length (low dword)
+    mov [fs_ex_size], eax
+    jmp .ex_sec_done
+.ex_not_stream:
+    cmp al, 0xC1                     ; file name entry
+    jne .ex_sec_done
+    xor ecx, ecx
+.ex_name_loop:
+    cmp ecx, 15
+    jae .ex_sec_done
+    mov ax, [rsi + 2 + rcx*2]        ; UTF-16 char
+    test ax, ax
+    jz .ex_sec_done
+    cmp ax, 0x7F
+    jbe .ex_ch_ok
+    mov al, '?'
+.ex_ch_ok:
+    push rcx
+    call print_char
+    pop rcx
+    inc dword [fs_name_len]
+    inc ecx
+    jmp .ex_name_loop
+.ex_sec_done:
+    dec byte [fs_ex_nrem]
+    jnz .skip
+    mov byte [fs_ex_active], 0
+    call fs_ex_finish_entry
+    jmp .skip
 .not_end:
     clc
     ret
 .end_marker:
     stc
+    ret
+
+; --- Pad the exFAT name to the column and print "<DIR>" or the size. ---
+fs_ex_finish_entry:
+.pad_loop:
+    cmp dword [fs_name_len], 14
+    jae .pad_done
+    mov al, ' '
+    call print_char
+    inc dword [fs_name_len]
+    jmp .pad_loop
+.pad_done:
+    test byte [fs_ex_attr], 0x10
+    jz .file
+    mov rsi, fs_dir_tag_msg
+    call print_string
+    jmp .cr
+.file:
+    mov eax, [fs_ex_size]
+    call print_dec64
+.cr:
+    mov al, ASCII_CR
+    call print_char
     ret
 
 ; --- Print one 8.3 directory entry at rsi: "NAME.EXT" padded to a column,

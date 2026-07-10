@@ -157,6 +157,13 @@ fs_data_lba dd 0
 fs_spc dd 0
 fs_cur_cluster dd 0
 fs_is_fat32 db 0
+fs_is_exfat db 0
+fs_ex_attr db 0
+fs_ex_nrem db 0
+fs_ex_active db 0
+fs_ex_size dd 0
+fs_gpt_ent_lba dd 0
+fs_gpt_left dd 0
 fs_fat_cached dd 0
 fs_name_len dd 0
 fs_entry_off dd 0
