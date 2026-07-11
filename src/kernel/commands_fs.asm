@@ -491,6 +491,7 @@ fs_mount:
     mov dword [fs_part_lba], 0
     mov byte [fs_is_exfat], 0
     mov byte [fs_is_ntfs], 0
+    mov byte [fs_is_fat16], 0
     mov dword [fs_fat_cached], 0xFFFFFFFF
     xor eax, eax
     mov edi, FS_SECTOR_BUF
@@ -608,12 +609,33 @@ fs_mount:
     add ebx, eax
     mov [fs_data_lba], ebx               ; first sector of cluster 2
     mov byte [fs_is_fat32], 0
+    mov byte [fs_is_fat16], 0
     cmp word [FS_SECTOR_BUF + 17], 0     ; no fixed root -> FAT32
-    jne .done
+    jne .fat1x
     mov byte [fs_is_fat32], 1
     mov eax, [FS_SECTOR_BUF + 44]        ; root directory cluster
     and eax, 0x0FFFFFFF
     mov [fs_cur_cluster], eax
+    jmp .done
+.fat1x:
+    ; fixed root region: FAT12 or FAT16, distinguished by cluster count
+    ; (the classic >= 4085 clusters -> FAT16 rule). FAT12 write isn't
+    ; implemented (packed 12-bit entries), so it's left unsupported.
+    movzx eax, word [FS_SECTOR_BUF + 19] ; total sectors (16-bit)
+    test eax, eax
+    jnz .have_tot1x
+    mov eax, [FS_SECTOR_BUF + 32]        ; total sectors (32-bit)
+.have_tot1x:
+    mov ecx, eax
+    mov eax, [fs_data_lba]
+    sub eax, [fs_part_lba]               ; sectors before the data region
+    sub ecx, eax                         ; data sectors
+    mov eax, ecx
+    xor edx, edx
+    div dword [fs_spc]                   ; eax = cluster count
+    cmp eax, 4085
+    jb .done
+    mov byte [fs_is_fat16], 1
 .done:
     pop rbx
     clc
@@ -1956,19 +1978,40 @@ fs_cat_root:
     ret
 
 ; --- "echo <text> > <filename>" handler: writes fs_echo_ptr/fs_echo_len
-; bytes to fs_target_name in the mounted volume's root directory. FAT32
-; only - exFAT/NTFS and FAT12/16 (different FAT entry width, not handled
-; here) are rejected to avoid corrupting the volume. Creates the file if
-; it doesn't exist, or overwrites it in place (reusing its directory
-; entry, allocating a fresh cluster chain) if it does. CF set on I/O
-; error; "no free directory entry" is reported and treated as handled. ---
+; bytes to fs_target_name in the mounted volume's root directory. FAT32/16
+; only - exFAT/NTFS and FAT12 (packed 12-bit entries, not handled here) are
+; rejected to avoid corrupting the volume. Creates the file if it doesn't
+; exist, or overwrites it in place (reusing its directory entry, allocating
+; a fresh cluster) if it does. CF set on I/O error; "no free directory
+; entry" is reported and treated as handled. ---
 fs_echo_root:
     cmp byte [fs_is_ntfs], 0
     jne .unsupported
     cmp byte [fs_is_exfat], 0
     jne .unsupported
     cmp byte [fs_is_fat32], 0
+    jne .fat32
+    cmp byte [fs_is_fat16], 0
     je .unsupported
+    mov byte [fs_echo_found], 0
+    mov byte [fs_echo_have_slot], 0
+    mov eax, [fs_root_lba]
+    mov [fs_cur_lba], eax
+    mov eax, [fs_root_secs]
+    mov [fs_sec_count], eax
+.f16_loop:
+    cmp dword [fs_sec_count], 0
+    je .search_done
+    mov eax, [fs_cur_lba]
+    mov edi, FS_SECTOR_BUF
+    call fs_read_sector
+    jc .fail
+    call fs_echo_sector
+    jc .search_done
+    inc dword [fs_cur_lba]
+    dec dword [fs_sec_count]
+    jmp .f16_loop
+.fat32:
     mov byte [fs_echo_found], 0
     mov byte [fs_echo_have_slot], 0
 .clus_loop:
@@ -2113,7 +2156,7 @@ fs_echo_sector:
     stc
     ret
 
-; --- Allocate one free FAT32 cluster for fs_echo_len bytes (0 bytes ->
+; --- Allocate one free FAT32/16 cluster for fs_echo_len bytes (0 bytes ->
 ; cluster 0, no allocation). echo's input is bounded well under one
 ; cluster (CMD_BUFFER_SIZE = 128 bytes vs. a minimum 512-byte cluster),
 ; so a single cluster always suffices - no chain-linking needed. Scans
@@ -2137,7 +2180,13 @@ fs_echo_alloc:
     dec dword [fs_cat_remain]
     mov eax, [fs_cat_size]
     mov ecx, eax
-    shr ecx, 7
+    cmp byte [fs_is_fat16], 0
+    jne .idx16
+    shr ecx, 7                        ; 128 32-bit entries/sector (FAT32)
+    jmp .idx_have
+.idx16:
+    shr ecx, 8                        ; 256 16-bit entries/sector (FAT16)
+.idx_have:
     add ecx, [fs_fat_lba]
     cmp ecx, [fs_fat_cached]
     je .cached
@@ -2149,11 +2198,21 @@ fs_echo_alloc:
     mov dword [fs_fat_cached], 0xFFFFFFFF
     jmp .fail
 .cached:
+    cmp byte [fs_is_fat16], 0
+    jne .cached16
     mov eax, [fs_cat_size]
     and eax, 127
     cmp dword [FS_FAT_BUF + rax*4], 0
     jne .next
     mov dword [FS_FAT_BUF + rax*4], 0x0FFFFFFF   ; mark end-of-chain
+    jmp .mark
+.cached16:
+    mov eax, [fs_cat_size]
+    and eax, 255
+    cmp word [FS_FAT_BUF + rax*2], 0
+    jne .next
+    mov word [FS_FAT_BUF + rax*2], 0xFFFF        ; mark end-of-chain
+.mark:
     mov eax, [fs_cat_size]
     mov [fs_echo_cluster], eax
     mov eax, [fs_fat_cached]

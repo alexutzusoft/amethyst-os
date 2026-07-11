@@ -159,6 +159,7 @@ fs_data_lba dd 0
 fs_spc dd 0
 fs_cur_cluster dd 0
 fs_is_fat32 db 0
+fs_is_fat16 db 0
 fs_is_exfat db 0
 fs_ex_attr db 0
 fs_ex_nrem db 0
