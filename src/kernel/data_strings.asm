@@ -49,6 +49,7 @@ net_cmd db "net"
 net_cmd_end:
 
 unknown_msg db "Unknown command: ", 0
+break_msg db "^C", 0
 run_bad_hex_msg db "Invalid hex byte", 0
 run_too_long_msg db "Too many bytes for exec_buffer", 0
 reboot_msg db "Rebooting...", 0
@@ -255,6 +256,12 @@ shift_state db 0
 caps_lock db 0
 ctrl_state db 0
 extended_pending db 0
+; Set by check_break when a Ctrl+C chord is polled during a running command;
+; process_command clears it before each dispatch and reports it afterward.
+break_pending db 0
+; check_break's own Ctrl make/break tracking - separate from ctrl_state, which
+; only the IRQ1 path maintains and which never fires while a command runs.
+poll_ctrl_state db 0
 cmd_cursor db 0
 sel_active db 0
 sel_anchor db 0

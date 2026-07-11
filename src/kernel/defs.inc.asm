@@ -111,6 +111,7 @@ SC_LSHIFT   equ 0x2A
 SC_RSHIFT   equ 0x36
 SC_CAPSLOCK equ 0x3A
 SC_CTRL     equ 0x1D   ; LCtrl (bare) and RCtrl (0xE0-prefixed) share this base code
+SC_C        equ 0x2E   ; 'c'/'C' make code - used to poll for the Ctrl+C break chord
 SC_LEFT     equ 0x4B   ; only valid 0xE0-prefixed (set-1 arrows are all extended codes)
 SC_RIGHT    equ 0x4D
 SC_UP       equ 0x48

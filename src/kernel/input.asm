@@ -608,6 +608,11 @@ process_command:
     cmp byte [cmd_buffer], 0
     je .done
 
+    ; A fresh command starts cancellable: clear any stale break state so a
+    ; Ctrl+C from a previous command can't abort this one instantly.
+    mov byte [break_pending], 0
+    mov byte [poll_ctrl_state], 0
+
     mov r11, command_table
 .find_loop:
     mov rax, [r11]
@@ -641,6 +646,12 @@ process_command:
     lea rsi, [cmd_buffer + r9 + 1]
 .invoke:
     call r10
+    ; If the handler bailed out on a Ctrl+C, echo "^C" so the abort is visible.
+    cmp byte [break_pending], 0
+    je .newline_only
+    mov byte [break_pending], 0
+    mov rsi, break_msg
+    call print_string
     jmp .newline_only
 
 .not_found:
@@ -653,6 +664,45 @@ process_command:
     mov al, ASCII_CR
     call print_char
 .done:
+    ret
+
+; --- Poll the 8042 for a Ctrl+C chord while a command is running.
+; Command handlers execute inside keyboard_isr with interrupts disabled and
+; no EOI sent yet, so the normal IRQ1 path never fires mid-command; any loop
+; that can block must call this to stay cancellable. Tracks Ctrl make/break
+; locally (the ISR's ctrl_state is not updated here) and sets break_pending
+; on Ctrl+C. Drains and discards every other byte, including mouse aux data.
+; Preserves all registers. ---
+check_break:
+    push rax
+.drain:
+    in al, KBD_CMD_PORT             ; 0x64 status register
+    test al, KBD_STATUS_OUTPUT_FULL
+    jz .done                        ; output buffer empty - nothing to read
+    test al, KBD_STATUS_AUX_DATA
+    jnz .discard                    ; mouse byte - read and throw away
+    in al, KBD_DATA_PORT
+    cmp al, SC_CTRL                 ; 0x1D: Ctrl make (LCtrl, or RCtrl after 0xE0)
+    je .ctrl_down
+    cmp al, SC_CTRL | KBD_BREAK_BIT ; 0x9D: Ctrl break
+    je .ctrl_up
+    cmp al, SC_C                    ; 0x2E: 'c' make
+    jne .drain
+    cmp byte [poll_ctrl_state], 0
+    je .drain
+    mov byte [break_pending], 1
+    jmp .drain
+.ctrl_down:
+    mov byte [poll_ctrl_state], 1
+    jmp .drain
+.ctrl_up:
+    mov byte [poll_ctrl_state], 0
+    jmp .drain
+.discard:
+    in al, KBD_DATA_PORT
+    jmp .drain
+.done:
+    pop rax
     ret
 
 ; --- "echo" handler: rsi -> nul-terminated argument string ---

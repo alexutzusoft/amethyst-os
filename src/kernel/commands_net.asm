@@ -561,6 +561,9 @@ dhcp_run:
     jmp .got_offer
 
 .poll_offer_delay:
+    call check_break
+    cmp byte [break_pending], 0
+    jne .failed                ; Ctrl+C: give up the DHCP wait and unwind
     pause
     jmp .poll_offer
 
@@ -643,6 +646,9 @@ dhcp_run:
     jmp .got_ack
 
 .poll_ack_delay:
+    call check_break
+    cmp byte [break_pending], 0
+    jne .failed                ; Ctrl+C: give up the DHCP wait and unwind
     pause
     jmp .poll_ack
 

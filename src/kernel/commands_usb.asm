@@ -340,7 +340,18 @@ xhci_wait_event:
     clc
     ret
 .retry:
-    loop .spin
+    ; Every 4096 spins, poll for Ctrl+C so long USB/FS transfers stay
+    ; cancellable. On break, return CF=1 (same as a timeout) so the caller
+    ; unwinds cleanly; process_command then reports the "^C".
+    test cx, 0x0FFF
+    jnz .no_break_check
+    call check_break
+    cmp byte [break_pending], 0
+    jne .aborted
+.no_break_check:
+    dec ecx                     ; near-jump countdown (was `loop`, now out of rel8 range)
+    jnz .spin
+.aborted:
     pop rbx
     pop rax
     pop rcx
