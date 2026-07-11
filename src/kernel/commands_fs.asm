@@ -216,6 +216,60 @@ fs_read_sector:
     pop rcx
     ret
 
+; --- Run one SCSI command with an OUT (host-to-device) data phase. Same CBW
+; field conventions as fs_scsi_cmd; edi = data-out buffer. ---
+fs_scsi_cmd_out:
+    push rbx
+    mov ebx, edi
+    mov eax, [bot_tag]
+    inc dword [bot_tag]
+    mov dword [FS_CBW + 0], 0x43425355   ; 'USBC'
+    mov [FS_CBW + 4], eax
+    mov byte [FS_CBW + 13], 0
+    mov edi, FS_CBW
+    mov ecx, 31
+    call fs_bulk_out
+    jc .fail
+    mov ecx, [FS_CBW + 8]
+    test ecx, ecx
+    jz .csw
+    mov edi, ebx
+    call fs_bulk_out
+    jc .fail
+.csw:
+    mov edi, FS_CSW
+    mov ecx, 13
+    call fs_bulk_in
+    jc .fail
+    cmp dword [FS_CSW], 0x53425355
+    jne .fail
+    cmp byte [FS_CSW + 12], 0
+    jne .fail
+    pop rbx
+    clc
+    ret
+.fail:
+    pop rbx
+    stc
+    ret
+
+; --- SCSI WRITE(10): one 512-byte sector. eax = absolute LBA, edi = buffer. ---
+fs_write_sector:
+    push rcx
+    mov dword [FS_CBW + 8], 512
+    mov byte [FS_CBW + 12], 0        ; host-to-device
+    mov byte [FS_CBW + 14], 10
+    mov byte [FS_CBW + 15], 0x2A     ; WRITE(10)
+    mov byte [FS_CBW + 16], 0
+    bswap eax
+    mov [FS_CBW + 17], eax           ; LBA, big-endian
+    mov dword [FS_CBW + 21], 0x00010000  ; group 0, count 0x0001 BE, control 0
+    mov dword [FS_CBW + 25], 0
+    mov word [FS_CBW + 29], 0
+    call fs_scsi_cmd_out
+    pop rcx
+    ret
+
 ; --- SCSI TEST UNIT READY (no data). CF = not ready. ---
 fs_test_ready:
     mov dword [FS_CBW + 8], 0
@@ -1500,11 +1554,16 @@ fs_try_port:
     call fs_mount
     jc .fs_err
     cmp byte [fs_action], 0
-    jne .do_cat
+    je .do_list
+    cmp byte [fs_action], 2
+    je .do_echo
+    call fs_cat_root
+    jmp .listed
+.do_list:
     call fs_list_root
     jmp .listed
-.do_cat:
-    call fs_cat_root
+.do_echo:
+    call fs_echo_root
 .listed:
     jc .io_err
     mov byte [fs_found], 1
@@ -1702,6 +1761,7 @@ fs_build_target_name:
     jnz .clear
     lea rdi, [fs_target_name]
     xor ecx, ecx
+    xor ebx, ebx                     ; case flags: 1=name-lower 2=name-upper 4=ext-lower 8=ext-upper
 .name_loop:
     mov al, [rsi]
     or al, al
@@ -1713,10 +1773,18 @@ fs_build_target_name:
     cmp ecx, 8
     jae .skip_char
     cmp al, 'a'
-    jb .store
+    jb .name_check_upper
     cmp al, 'z'
     ja .store
+    or bl, 1
     sub al, 0x20
+    jmp .store
+.name_check_upper:
+    cmp al, 'A'
+    jb .store
+    cmp al, 'Z'
+    ja .store
+    or bl, 2
 .store:
     mov [rdi + rcx], al
     inc ecx
@@ -1735,10 +1803,18 @@ fs_build_target_name:
     cmp ecx, 3
     jae .ext_skip
     cmp al, 'a'
-    jb .ext_store
+    jb .ext_check_upper
     cmp al, 'z'
     ja .ext_store
+    or bl, 4
     sub al, 0x20
+    jmp .ext_store
+.ext_check_upper:
+    cmp al, 'A'
+    jb .ext_store
+    cmp al, 'Z'
+    ja .ext_store
+    or bl, 8
 .ext_store:
     mov [rdi + 8 + rcx], al
     inc ecx
@@ -1746,6 +1822,19 @@ fs_build_target_name:
     inc rsi
     jmp .ext_loop
 .done:
+    mov byte [fs_target_case], 0
+    test bl, 2                       ; name has an uppercase letter: leave as 8.3-upper
+    jnz .no_name_lower
+    test bl, 1
+    jz .no_name_lower
+    or byte [fs_target_case], 0x08
+.no_name_lower:
+    test bl, 8                       ; extension has an uppercase letter
+    jnz .no_ext_lower
+    test bl, 4
+    jz .no_ext_lower
+    or byte [fs_target_case], 0x10
+.no_ext_lower:
     pop rdi
     pop rcx
     pop rbx
@@ -1864,6 +1953,307 @@ fs_cat_root:
 .ntfs_found:
     call fs_cat_ntfs_data
     clc
+    ret
+
+; --- "echo <text> > <filename>" handler: writes fs_echo_ptr/fs_echo_len
+; bytes to fs_target_name in the mounted volume's root directory. FAT32
+; only - exFAT/NTFS and FAT12/16 (different FAT entry width, not handled
+; here) are rejected to avoid corrupting the volume. Creates the file if
+; it doesn't exist, or overwrites it in place (reusing its directory
+; entry, allocating a fresh cluster chain) if it does. CF set on I/O
+; error; "no free directory entry" is reported and treated as handled. ---
+fs_echo_root:
+    cmp byte [fs_is_ntfs], 0
+    jne .unsupported
+    cmp byte [fs_is_exfat], 0
+    jne .unsupported
+    cmp byte [fs_is_fat32], 0
+    je .unsupported
+    mov byte [fs_echo_found], 0
+    mov byte [fs_echo_have_slot], 0
+.clus_loop:
+    mov eax, [fs_cur_cluster]
+    cmp eax, 2
+    jb .search_done
+    cmp eax, 0x0FFFFFF8
+    jae .search_done
+    mov [fs_echo_clus], eax
+    sub eax, 2
+    imul eax, [fs_spc]
+    add eax, [fs_data_lba]
+    mov [fs_cur_lba], eax
+    mov eax, [fs_spc]
+    mov [fs_sec_count], eax
+.sec_loop:
+    cmp dword [fs_sec_count], 0
+    je .next_clus
+    mov eax, [fs_cur_lba]
+    mov edi, FS_SECTOR_BUF
+    call fs_read_sector
+    jc .fail
+    call fs_echo_sector
+    jc .search_done
+    inc dword [fs_cur_lba]
+    dec dword [fs_sec_count]
+    jmp .sec_loop
+.next_clus:
+    mov eax, [fs_echo_clus]
+    shr eax, 7
+    add eax, [fs_fat_lba]
+    cmp eax, [fs_fat_cached]
+    je .cached
+    mov [fs_fat_cached], eax
+    mov edi, FS_FAT_BUF
+    call fs_read_sector
+    jnc .cached
+    mov dword [fs_fat_cached], 0xFFFFFFFF
+    jmp .fail
+.cached:
+    mov eax, [fs_echo_clus]
+    and eax, 127
+    mov eax, [FS_FAT_BUF + rax*4]
+    and eax, 0x0FFFFFFF
+    mov [fs_cur_cluster], eax
+    jmp .clus_loop
+.search_done:
+    cmp byte [fs_echo_found], 0
+    jne .have_target
+    cmp byte [fs_echo_have_slot], 0
+    jne .have_target
+    mov rsi, fs_echo_nospace_msg
+    call print_string
+    mov al, ASCII_CR
+    call print_char
+    clc
+    ret
+.have_target:
+    call fs_echo_alloc
+    jc .fail
+    call fs_echo_write_data
+    jc .fail
+    call fs_echo_write_entry
+    jc .fail
+    clc
+    ret
+.fail:
+    stc
+    ret
+.unsupported:
+    mov rsi, fs_echo_unsupported_msg
+    call print_string
+    mov al, ASCII_CR
+    call print_char
+    clc
+    ret
+
+; --- Scan the 16 directory entries in FS_SECTOR_BUF for fs_target_name
+; (overwrite target) and, in the same pass, the first free (0x00 or 0xE5)
+; entry (create target, recorded in fs_echo_lba/off if fs_echo_have_slot
+; was still 0). CF set to stop the caller's scan: an exact name match was
+; found (fs_echo_found=1) or the 0x00 end-of-directory marker was hit. ---
+fs_echo_sector:
+    mov dword [fs_entry_off], 0
+.loop:
+    mov eax, [fs_entry_off]
+    cmp eax, 512
+    jae .not_end
+    mov esi, FS_SECTOR_BUF
+    add esi, eax
+    mov al, [rsi]
+    test al, al
+    jz .end_marker
+    cmp al, 0xE5
+    je .free_slot
+    mov al, [rsi + 11]
+    test al, 0x08                    ; volume label / LFN entry
+    jnz .skip
+    push rcx
+    push rdi
+    push rsi
+    lea rdi, [fs_target_name]
+    mov rcx, 11
+    repe cmpsb
+    pop rsi
+    pop rdi
+    pop rcx
+    jne .skip
+    mov al, [rsi + 11]
+    test al, 0x10                    ; directory: echo doesn't support this
+    jnz .skip
+    mov eax, [fs_cur_lba]
+    mov [fs_echo_lba], eax
+    mov eax, [fs_entry_off]
+    mov [fs_echo_off], eax
+    mov byte [fs_echo_found], 1
+    stc
+    ret
+.free_slot:
+    cmp byte [fs_echo_have_slot], 0
+    jne .skip
+    mov eax, [fs_cur_lba]
+    mov [fs_echo_lba], eax
+    mov eax, [fs_entry_off]
+    mov [fs_echo_off], eax
+    mov byte [fs_echo_have_slot], 1
+.skip:
+    add dword [fs_entry_off], 32
+    jmp .loop
+.not_end:
+    clc
+    ret
+.end_marker:
+    cmp byte [fs_echo_have_slot], 0
+    jne .stop
+    mov eax, [fs_cur_lba]
+    mov [fs_echo_lba], eax
+    mov eax, [fs_entry_off]
+    mov [fs_echo_off], eax
+    mov byte [fs_echo_have_slot], 1
+.stop:
+    stc
+    ret
+
+; --- Allocate one free FAT32 cluster for fs_echo_len bytes (0 bytes ->
+; cluster 0, no allocation). echo's input is bounded well under one
+; cluster (CMD_BUFFER_SIZE = 128 bytes vs. a minimum 512-byte cluster),
+; so a single cluster always suffices - no chain-linking needed. Scans
+; the FAT for the first free (0) entry starting at cluster 2, marks it
+; end-of-chain, and flushes that FAT sector. Result in fs_echo_cluster.
+; CF set on read/write error, "file too large" or "volume full". ---
+fs_echo_alloc:
+    mov dword [fs_echo_cluster], 0
+    mov eax, [fs_echo_len]
+    test eax, eax
+    jz .done
+    mov ecx, [fs_spc]
+    shl ecx, 9                        ; bytes/cluster
+    cmp eax, ecx
+    ja .too_big
+    mov dword [fs_cat_size], 2        ; candidate cluster
+    mov dword [fs_cat_remain], 2000000 ; scan cap: bounded, no runaway
+.scan:
+    cmp dword [fs_cat_remain], 0
+    je .nospace
+    dec dword [fs_cat_remain]
+    mov eax, [fs_cat_size]
+    mov ecx, eax
+    shr ecx, 7
+    add ecx, [fs_fat_lba]
+    cmp ecx, [fs_fat_cached]
+    je .cached
+    mov [fs_fat_cached], ecx
+    mov eax, ecx
+    mov edi, FS_FAT_BUF
+    call fs_read_sector
+    jnc .cached
+    mov dword [fs_fat_cached], 0xFFFFFFFF
+    jmp .fail
+.cached:
+    mov eax, [fs_cat_size]
+    and eax, 127
+    cmp dword [FS_FAT_BUF + rax*4], 0
+    jne .next
+    mov dword [FS_FAT_BUF + rax*4], 0x0FFFFFFF   ; mark end-of-chain
+    mov eax, [fs_cat_size]
+    mov [fs_echo_cluster], eax
+    mov eax, [fs_fat_cached]
+    mov edi, FS_FAT_BUF
+    call fs_write_sector
+    jc .fail
+    clc
+    ret
+.next:
+    inc dword [fs_cat_size]
+    jmp .scan
+.done:
+    clc
+    ret
+.nospace:
+    mov rsi, fs_echo_nospace_msg
+    call print_string
+    mov al, ASCII_CR
+    call print_char
+    stc
+    ret
+.too_big:
+    mov rsi, fs_echo_toobig_msg
+    call print_string
+    mov al, ASCII_CR
+    call print_char
+    stc
+    ret
+.fail:
+    stc
+    ret
+
+; --- Write fs_echo_ptr/fs_echo_len bytes (0 bytes -> nothing to do) into
+; the single cluster fs_echo_cluster, zero-padding the rest of the
+; sector. CF set on write error. ---
+fs_echo_write_data:
+    mov eax, [fs_echo_len]
+    test eax, eax
+    jz .done
+    mov eax, [fs_echo_cluster]
+    sub eax, 2
+    imul eax, [fs_spc]
+    add eax, [fs_data_lba]
+    mov [fs_cur_lba], eax
+    mov rsi, [fs_echo_ptr]
+    lea rdi, [FS_SECTOR_BUF]
+    mov ecx, [fs_echo_len]
+    rep movsb
+    mov ecx, 512
+    sub ecx, [fs_echo_len]
+    jz .no_pad
+    xor al, al
+    rep stosb
+.no_pad:
+    mov eax, [fs_cur_lba]
+    mov edi, FS_SECTOR_BUF
+    call fs_write_sector
+    jc .fail
+.done:
+    clc
+    ret
+.fail:
+    stc
+    ret
+
+; --- Write the 32-byte directory entry (fs_target_name, fs_echo_cluster,
+; fs_echo_len) at fs_echo_lba/off. CF set on read/write error. ---
+fs_echo_write_entry:
+    mov eax, [fs_echo_lba]
+    mov edi, FS_SECTOR_BUF
+    call fs_read_sector
+    jc .fail
+    mov eax, [fs_echo_off]
+    lea rdi, [FS_SECTOR_BUF + rax]
+    lea rsi, [fs_target_name]
+    mov ecx, 11
+    rep movsb
+    mov byte [rdi], 0x20              ; ATTR_ARCHIVE
+    mov ecx, 16
+    xor eax, eax
+    rep stosb                         ; reserved/time/date/cluster-hi fields
+    mov eax, [fs_echo_off]
+    lea rdi, [FS_SECTOR_BUF + rax]
+    mov al, [fs_target_case]
+    mov [rdi + 12], al                ; NT reserved byte: lowercase 8.3 flags
+    mov eax, [fs_echo_cluster]
+    mov ecx, eax
+    shr ecx, 16
+    mov [rdi + 20], cx                ; first cluster, high word
+    mov [rdi + 26], ax                ; first cluster, low word
+    mov eax, [fs_echo_len]
+    mov [rdi + 28], eax                ; file size
+    mov eax, [fs_echo_lba]
+    mov edi, FS_SECTOR_BUF
+    call fs_write_sector
+    jc .fail
+    clc
+    ret
+.fail:
+    stc
     ret
 
 ; --- Scan the 16 directory entries in FS_SECTOR_BUF for fs_target_name.

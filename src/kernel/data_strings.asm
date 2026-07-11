@@ -180,6 +180,7 @@ fs_sec_count dd 0
 fs_cur_lba dd 0
 fs_action db 0
 fs_target_name times 11 db 0
+fs_target_case db 0
 fs_target_raw times 255 db 0
 fs_target_raw_len dd 0
 fs_ex_name_buf times 255 db 0
@@ -188,6 +189,17 @@ fs_cat_cluster dd 0
 fs_cat_size dd 0
 fs_cat_remain dd 0
 fs_cat_ntfs_ref dd 0
+fs_echo_lba dd 0
+fs_echo_off dd 0
+fs_echo_have_slot db 0
+fs_echo_found db 0
+fs_echo_ptr dq 0
+fs_echo_len dd 0
+fs_echo_cluster dd 0
+fs_echo_clus dd 0
+redir_pos dq 0
+fs_echo_fname dq 0
+echo_data_buf times CMD_BUFFER_SIZE + 1 db 0
 cmd_len db 0
 cmd_buffer times CMD_BUFFER_SIZE db 0
 timer_ticks dq 0

@@ -51,7 +51,7 @@ command_descriptions:
     dq desc_dir,      desc_dir_end - desc_dir
     dq desc_cat,      desc_cat_end - desc_cat
 
-desc_echo db "print the given text"
+desc_echo db "print text, or write it to a file: echo <text> [> <filename>] (FAT)"
 desc_echo_end:
 desc_run db "assemble and execute raw hex machine code: run <hex bytes>"
 desc_run_end:
@@ -163,4 +163,8 @@ fs_no_fat_msg db "No FAT/exFAT/NTFS filesystem found on the USB device.", 0
 fs_dir_tag_msg db "<DIR>", 0
 cat_usage_msg db "Usage: cat <filename>", 0
 fs_cat_notfound_msg db "cat: file not found", 0
+echo_redir_usage_msg db "Usage: echo <text> > <filename>", 0
+fs_echo_unsupported_msg db "echo: only FAT12/16/32 write is supported (found exFAT/NTFS, or FAT12/16 volume)", 0
+fs_echo_nospace_msg db "echo: no free directory entry or cluster", 0
+fs_echo_toobig_msg db "echo: text too large for one cluster", 0
 

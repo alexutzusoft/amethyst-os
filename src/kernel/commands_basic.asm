@@ -1,5 +1,130 @@
+; --- "echo <text>" prints text; "echo <text> > <filename>" writes it to a
+; file instead (FAT only - see fs_echo_root in commands_fs.asm). rsi ->
+; nul-terminated argument string. ---
 cmd_echo:
+    push rsi
+    mov rdi, rsi
+.find_redir:
+    mov al, [rdi]
+    or al, al
+    jz .no_redir
+    cmp al, '>'
+    je .redir
+    inc rdi
+    jmp .find_redir
+.redir:
+    mov rax, rdi                     ; rax -> '>' char, rsi (on stack) -> text start
+    mov [redir_pos], rax
+    inc rdi                          ; rdi -> filename field
+.skip_fname_spaces:
+    mov al, [rdi]
+    cmp al, ' '
+    jne .have_fname
+    inc rdi
+    jmp .skip_fname_spaces
+.have_fname:
+    mov al, [rdi]
+    or al, al
+    jz .usage
+    mov [fs_echo_fname], rdi         ; filename field, saved before rdi is reused
+    ; trim trailing spaces off the text part [rsi .. redir_pos)
+    pop rsi
+    push rsi
+    mov rax, [redir_pos]
+.trim:
+    cmp rax, rsi
+    jbe .len_done
+    cmp byte [rax - 1], ' '
+    jne .len_done
+    dec rax
+    jmp .trim
+.len_done:
+    sub rax, rsi
+    mov ecx, eax
+    lea rdi, [echo_data_buf]
+    call fs_echo_unescape
+    mov [fs_echo_len], eax
+    lea rax, [echo_data_buf]
+    mov [fs_echo_ptr], rax
+    mov rsi, [fs_echo_fname]
+    call fs_build_target_name
+    mov byte [fs_action], 2
+    call fs_scan_devices
+    pop rsi
+    ret
+.no_redir:
+    pop rsi
+    push rsi
+    xor ecx, ecx
+.strlen:
+    cmp byte [rsi + rcx], 0
+    je .strlen_done
+    inc ecx
+    jmp .strlen
+.strlen_done:
+    lea rdi, [echo_data_buf]
+    call fs_echo_unescape
+    pop rsi
+    lea rsi, [echo_data_buf]
     call print_string
+    ret
+.usage:
+    pop rsi
+    mov rsi, echo_redir_usage_msg
+    call print_string
+    mov al, ASCII_CR
+    call print_char
+    ret
+
+; --- Copy rsi[0..ecx) to rdi, translating "\n" -> CR and "\\" -> "\"
+; (a lone trailing backslash is copied literally). nul-terminates the
+; result. Returns the output length in eax. ---
+fs_echo_unescape:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    xor ebx, ebx
+.loop:
+    test ecx, ecx
+    jz .done
+    mov al, [rsi]
+    cmp al, '\'
+    jne .plain
+    cmp ecx, 1
+    je .plain
+    mov dl, [rsi + 1]
+    cmp dl, 'n'
+    je .esc_n
+    cmp dl, '\'
+    je .esc_bs
+.plain:
+    mov [rdi + rbx], al
+    inc rbx
+    inc rsi
+    dec ecx
+    jmp .loop
+.esc_n:
+    mov byte [rdi + rbx], ASCII_CR
+    inc rbx
+    add rsi, 2
+    sub ecx, 2
+    jmp .loop
+.esc_bs:
+    mov byte [rdi + rbx], '\'
+    inc rbx
+    add rsi, 2
+    sub ecx, 2
+    jmp .loop
+.done:
+    mov byte [rdi + rbx], 0
+    mov eax, ebx
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
     ret
 
 ; --- "run" handler: rsi -> nul-terminated hex-byte string, e.g.
