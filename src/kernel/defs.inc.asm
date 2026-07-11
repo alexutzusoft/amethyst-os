@@ -156,3 +156,57 @@ CMD_HISTORY_ENTRIES equ 16
 PIT_HZ equ 100
 PIT_DIVISOR equ 11931   ; 1193182 / PIT_HZ, rounded
 
+; --- e1000 (Intel Gigabit) register offsets, byte offsets into BAR0 MMIO ---
+E1000_CTRL   equ 0x0000
+E1000_STATUS equ 0x0008
+E1000_EECD   equ 0x0010
+E1000_EERD   equ 0x0014
+E1000_ICR    equ 0x00C0
+E1000_IMS    equ 0x00D0
+E1000_IMC    equ 0x00D8
+E1000_RCTL   equ 0x0100
+E1000_TCTL   equ 0x0400
+E1000_TIPG   equ 0x0410
+E1000_RDBAL  equ 0x2800
+E1000_RDBAH  equ 0x2804
+E1000_RDLEN  equ 0x2808
+E1000_RDH    equ 0x2810
+E1000_RDT    equ 0x2818
+E1000_TDBAL  equ 0x3800
+E1000_TDBAH  equ 0x3804
+E1000_TDLEN  equ 0x3808
+E1000_TDH    equ 0x3810
+E1000_TDT    equ 0x3818
+E1000_MTA    equ 0x5200   ; 128 dwords, must be zeroed
+E1000_RAL0   equ 0x5400
+E1000_RAH0   equ 0x5404
+
+E1000_CTRL_RST equ 1 << 26
+E1000_CTRL_SLU equ 1 << 6   ; set-link-up
+E1000_CTRL_ASDE equ 1 << 5  ; auto-speed detect
+E1000_CTRL_FD equ 1 << 0    ; full-duplex
+E1000_STATUS_LU equ 1 << 1  ; link up
+
+E1000_RCTL_EN     equ 1 << 1
+E1000_RCTL_BAM    equ 1 << 15  ; broadcast accept
+E1000_RCTL_SECRC  equ 1 << 26  ; strip Ethernet CRC
+E1000_TCTL_EN     equ 1 << 1
+E1000_TCTL_PSP    equ 1 << 3
+
+NET_RX_DESC_COUNT equ 16
+NET_TX_DESC_COUNT equ 16
+NET_BUF_SIZE      equ 2048
+
+; --- Network scratch region. 5MB mark: clear of FS_SCRATCH's highest use
+; (FS_INDX_BUF, FS_SCRATCH_BASE + 0x6000 + up to 16 sectors = ~0x408000). ---
+NET_SCRATCH_BASE  equ 0x500000
+NET_RX_RING       equ NET_SCRATCH_BASE + 0x0000  ; 16 * 16B descriptors
+NET_TX_RING       equ NET_SCRATCH_BASE + 0x1000  ; 16 * 16B descriptors
+NET_RX_BUFFERS    equ NET_SCRATCH_BASE + 0x2000  ; 16 * 2048B = 0x8000
+NET_TX_BUFFER     equ NET_SCRATCH_BASE + 0xA000  ; one 2048B scratch tx frame
+
+DHCP_NONE   equ 0
+DHCP_BOUND  equ 1
+DHCP_FAILED equ 2
+
+

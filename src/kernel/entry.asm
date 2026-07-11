@@ -84,6 +84,7 @@ long_mode_start:
     call enable_mouse_port
     call mouse_detect_wheel
     call setup_pit
+    call net_init
 
     mov al, 0x0D
     call print_char

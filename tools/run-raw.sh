@@ -5,4 +5,4 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-qemu-system-x86_64 -drive file=build/amethyst-os.img,format=raw -boot order=c
+qemu-system-x86_64 -drive file=build/amethyst-os.img,format=raw -boot order=c -netdev user,id=n0 -device e1000,netdev=n0

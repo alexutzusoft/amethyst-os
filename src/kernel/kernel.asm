@@ -13,6 +13,7 @@
 %include "src/kernel/commands_misc.asm"
 %include "src/kernel/commands_usb.asm"
 %include "src/kernel/commands_fs.asm"
+%include "src/kernel/commands_net.asm"
 %include "src/kernel/data_commands.asm"
 %include "src/kernel/display.asm"
 %include "src/kernel/data_strings.asm"

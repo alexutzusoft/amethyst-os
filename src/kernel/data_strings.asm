@@ -45,6 +45,9 @@ dir_cmd db "dir"
 dir_cmd_end:
 cat_cmd db "cat"
 cat_cmd_end:
+net_cmd db "net"
+net_cmd_end:
+
 unknown_msg db "Unknown command: ", 0
 run_bad_hex_msg db "Invalid hex byte", 0
 run_too_long_msg db "Too many bytes for exec_buffer", 0
@@ -304,3 +307,33 @@ shifted_scancode_table:
     db 'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '"', '~', 0
     db '|', 'Z', 'X', 'C', 'V', 'B', 'N', 'M', '<', '>', '?', 0
     db 0, 0, ' '
+
+net_mmio_base   dq 0
+net_have_nic    db 0
+net_mac_addr    times 6 db 0
+net_link_up     db 0
+net_dhcp_state  db 0
+net_ip          dd 0
+net_mask        dd 0
+net_gateway     dd 0
+net_dns         dd 0
+net_lease       dd 0
+net_rx_tail     dd 0
+net_tx_tail     dd 0
+net_pci_bus     db 0
+net_pci_dev     db 0
+net_pci_func    db 0
+
+dhcp_xid        dd 0
+dhcp_offered_ip dd 0
+dhcp_server_id  dd 0
+broadcast_mac   db 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+
+dhcp_msg_type_found   db 0
+dhcp_parsed_mask      dd 0
+dhcp_parsed_gateway   dd 0
+dhcp_parsed_dns       dd 0
+dhcp_parsed_lease     dd 0
+dhcp_parsed_server_id dd 0
+dhcp_parsed_yiaddr    dd 0
+

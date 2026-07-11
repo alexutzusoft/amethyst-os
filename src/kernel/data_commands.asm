@@ -23,6 +23,7 @@ command_table:
     dq ls_cmd, ls_cmd_end - ls_cmd, cmd_ls
     dq dir_cmd, dir_cmd_end - dir_cmd, cmd_ls
     dq cat_cmd, cat_cmd_end - cat_cmd, cmd_cat
+    dq net_cmd, net_cmd_end - net_cmd, cmd_net
     dq 0
 
 command_descriptions:
@@ -50,6 +51,7 @@ command_descriptions:
     dq desc_ls,       desc_ls_end - desc_ls
     dq desc_dir,      desc_dir_end - desc_dir
     dq desc_cat,      desc_cat_end - desc_cat
+    dq desc_net,      desc_net_end - desc_net
 
 desc_echo db "print text, or write it to a file: echo <text> [> <filename>] (FAT)"
 desc_echo_end:
@@ -99,6 +101,8 @@ desc_dir db "same as ls"
 desc_dir_end:
 desc_cat db "print a file's contents: cat <filename> (FAT, read-only)"
 desc_cat_end:
+desc_net db "show cached network link and DHCP status"
+desc_net_end:
 
 help_sep db " - ", 0
 color_usage_msg db "Usage: color <red|green|blue|yellow|white|HH>", 0
