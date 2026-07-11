@@ -164,7 +164,8 @@ fs_dir_tag_msg db "<DIR>", 0
 cat_usage_msg db "Usage: cat <filename>", 0
 fs_cat_notfound_msg db "cat: file not found", 0
 echo_redir_usage_msg db "Usage: echo <text> > <filename>", 0
-fs_echo_unsupported_msg db "echo: only FAT16/32 write is supported (found exFAT/NTFS, or FAT12 volume)", 0
+fs_echo_unsupported_msg db "echo: only FAT16/32/exFAT write is supported (found NTFS, or FAT12 volume)", 0
 fs_echo_nospace_msg db "echo: no free directory entry or cluster", 0
 fs_echo_toobig_msg db "echo: text too large for one cluster", 0
+fs_echo_name_toobig_msg db "echo: filename too long for exFAT write (max 15 chars)", 0
 

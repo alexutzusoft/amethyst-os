@@ -655,6 +655,8 @@ fs_mount:
     mov [fs_data_lba], eax
     mov eax, [FS_SECTOR_BUF + 96]        ; root directory first cluster
     mov [fs_cur_cluster], eax
+    mov eax, [FS_SECTOR_BUF + 92]        ; cluster count
+    mov [fs_ex_cluster_count], eax
     mov byte [fs_is_fat32], 0
     mov byte [fs_is_exfat], 1
     mov byte [fs_ex_active], 0
@@ -1760,6 +1762,8 @@ fs_build_target_name:
     je .raw_done
     cmp ebx, 255
     jae .raw_done
+    lea rdx, [fs_target_disp]
+    mov [rdx + rbx], al
     cmp al, 'a'
     jb .raw_store
     cmp al, 'z'
@@ -1978,17 +1982,18 @@ fs_cat_root:
     ret
 
 ; --- "echo <text> > <filename>" handler: writes fs_echo_ptr/fs_echo_len
-; bytes to fs_target_name in the mounted volume's root directory. FAT32/16
-; only - exFAT/NTFS and FAT12 (packed 12-bit entries, not handled here) are
-; rejected to avoid corrupting the volume. Creates the file if it doesn't
-; exist, or overwrites it in place (reusing its directory entry, allocating
-; a fresh cluster) if it does. CF set on I/O error; "no free directory
-; entry" is reported and treated as handled. ---
+; bytes to fs_target_name (FAT12/16/32) or fs_target_raw (exFAT, name capped
+; at 15 chars) in the mounted volume's root directory. NTFS and FAT12
+; (packed 12-bit entries, not handled here) are rejected to avoid
+; corrupting the volume. Creates the file if it doesn't exist, or
+; overwrites it in place (reusing its directory entry, allocating a fresh
+; cluster) if it does. CF set on I/O error; "no free directory entry" is
+; reported and treated as handled. ---
 fs_echo_root:
     cmp byte [fs_is_ntfs], 0
     jne .unsupported
     cmp byte [fs_is_exfat], 0
-    jne .unsupported
+    jne .exfat
     cmp byte [fs_is_fat32], 0
     jne .fat32
     cmp byte [fs_is_fat16], 0
@@ -2058,6 +2063,68 @@ fs_echo_root:
     and eax, 0x0FFFFFFF
     mov [fs_cur_cluster], eax
     jmp .clus_loop
+.exfat:
+    mov eax, [fs_target_raw_len]
+    cmp eax, 15
+    jbe .exfat_len_ok
+    mov rsi, fs_echo_name_toobig_msg
+    call print_string
+    mov al, ASCII_CR
+    call print_char
+    clc
+    ret
+.exfat_len_ok:
+    mov eax, [fs_cur_cluster]
+    mov [fs_ex_root_clus], eax
+    call fs_exfat_find_bitmap
+    mov eax, [fs_ex_root_clus]
+    mov [fs_cur_cluster], eax
+    mov byte [fs_echo_found], 0
+    mov byte [fs_echo_have_slot], 0
+    mov dword [fs_echo_ex_run], 0
+.exfat_clus_loop:
+    mov eax, [fs_cur_cluster]
+    cmp eax, 2
+    jb .search_done
+    cmp eax, 0x0FFFFFF8
+    jae .search_done
+    mov [fs_echo_clus], eax
+    sub eax, 2
+    imul eax, [fs_spc]
+    add eax, [fs_data_lba]
+    mov [fs_cur_lba], eax
+    mov eax, [fs_spc]
+    mov [fs_sec_count], eax
+.exfat_sec_loop:
+    cmp dword [fs_sec_count], 0
+    je .exfat_next_clus
+    mov eax, [fs_cur_lba]
+    mov edi, FS_SECTOR_BUF
+    call fs_read_sector
+    jc .fail
+    call fs_echo_sector_exfat
+    jc .search_done
+    inc dword [fs_cur_lba]
+    dec dword [fs_sec_count]
+    jmp .exfat_sec_loop
+.exfat_next_clus:
+    mov eax, [fs_echo_clus]
+    shr eax, 7
+    add eax, [fs_fat_lba]
+    cmp eax, [fs_fat_cached]
+    je .exfat_cached
+    mov [fs_fat_cached], eax
+    mov edi, FS_FAT_BUF
+    call fs_read_sector
+    jnc .exfat_cached
+    mov dword [fs_fat_cached], 0xFFFFFFFF
+    jmp .fail
+.exfat_cached:
+    mov eax, [fs_echo_clus]
+    and eax, 127
+    mov eax, [FS_FAT_BUF + rax*4]
+    mov [fs_cur_cluster], eax
+    jmp .exfat_clus_loop
 .search_done:
     cmp byte [fs_echo_found], 0
     jne .have_target
@@ -2070,6 +2137,17 @@ fs_echo_root:
     clc
     ret
 .have_target:
+    cmp byte [fs_is_exfat], 0
+    je .have_target_fat
+    call fs_echo_alloc_exfat
+    jc .fail
+    call fs_echo_write_data
+    jc .fail
+    call fs_echo_write_entry_exfat
+    jc .fail
+    clc
+    ret
+.have_target_fat:
     call fs_echo_alloc
     jc .fail
     call fs_echo_write_data
@@ -2087,6 +2165,451 @@ fs_echo_root:
     mov al, ASCII_CR
     call print_char
     clc
+    ret
+
+; --- Walk the root directory cluster chain (fs_cur_cluster) looking for the
+; exFAT allocation bitmap entry (type 0x81), recording its first cluster in
+; fs_ex_bitmap_clus (0 if not found). Mutates fs_cur_cluster/fs_fat_cached
+; like the other root-directory walkers - caller must save/restore
+; fs_cur_cluster around this call. ---
+fs_exfat_find_bitmap:
+    mov dword [fs_ex_bitmap_clus], 0
+.clus_loop:
+    mov eax, [fs_cur_cluster]
+    cmp eax, 2
+    jb .done
+    cmp eax, 0x0FFFFFF8
+    jae .done
+    mov [fs_echo_clus], eax
+    sub eax, 2
+    imul eax, [fs_spc]
+    add eax, [fs_data_lba]
+    mov [fs_cur_lba], eax
+    mov eax, [fs_spc]
+    mov [fs_sec_count], eax
+.sec_loop:
+    cmp dword [fs_sec_count], 0
+    je .next_clus
+    mov eax, [fs_cur_lba]
+    mov edi, FS_SECTOR_BUF
+    call fs_read_sector
+    jc .done
+    xor ecx, ecx
+.ent_loop:
+    cmp ecx, 512
+    jae .ent_done
+    mov esi, FS_SECTOR_BUF
+    add esi, ecx
+    mov al, [rsi]
+    test al, al
+    jz .done
+    cmp al, 0x81
+    jne .ent_next
+    mov eax, [rsi + 20]
+    mov [fs_ex_bitmap_clus], eax
+    jmp .done
+.ent_next:
+    add ecx, 32
+    jmp .ent_loop
+.ent_done:
+    inc dword [fs_cur_lba]
+    dec dword [fs_sec_count]
+    jmp .sec_loop
+.next_clus:
+    mov eax, [fs_echo_clus]
+    shr eax, 7
+    add eax, [fs_fat_lba]
+    cmp eax, [fs_fat_cached]
+    je .cached
+    mov [fs_fat_cached], eax
+    mov edi, FS_FAT_BUF
+    call fs_read_sector
+    jnc .cached
+    mov dword [fs_fat_cached], 0xFFFFFFFF
+    jmp .done
+.cached:
+    mov eax, [fs_echo_clus]
+    and eax, 127
+    mov eax, [FS_FAT_BUF + rax*4]
+    mov [fs_cur_cluster], eax
+    jmp .clus_loop
+.done:
+    ret
+
+; --- Scan the exFAT directory entries in FS_SECTOR_BUF for fs_target_raw
+; (name match, matching fs_cat_sector_exfat) and, in the same pass, a run of
+; 3 contiguous free/deleted entries (create target: file + stream + one
+; name entry, name capped at 15 chars by the caller). CF set to stop the
+; scan: an exact match (fs_echo_found=1) or the 0x00 end marker. ---
+fs_echo_sector_exfat:
+    mov dword [fs_entry_off], 0
+.loop:
+    mov eax, [fs_entry_off]
+    cmp eax, 512
+    jae .not_end
+    mov esi, FS_SECTOR_BUF
+    add esi, eax
+    mov al, [rsi]
+    test al, al
+    jz .end_marker
+    test al, 0x80
+    jnz .inuse
+    cmp dword [fs_echo_ex_run], 0
+    jne .run_have_start
+    mov eax, [fs_cur_lba]
+    mov [fs_echo_ex_run_lba], eax
+    mov eax, [fs_entry_off]
+    mov [fs_echo_ex_run_off], eax
+.run_have_start:
+    inc dword [fs_echo_ex_run]
+    cmp dword [fs_echo_ex_run], 3
+    jb .skip
+    cmp byte [fs_echo_have_slot], 0
+    jne .skip
+    mov byte [fs_echo_have_slot], 1
+    mov eax, [fs_echo_ex_run_lba]
+    mov [fs_echo_lba], eax
+    mov eax, [fs_echo_ex_run_off]
+    mov [fs_echo_off], eax
+    jmp .skip
+.inuse:
+    mov dword [fs_echo_ex_run], 0
+    cmp al, 0x85
+    je .ex_file
+    cmp byte [fs_ex_active], 0
+    je .skip
+    cmp al, 0xC1                     ; file name entry
+    jne .ex_sec_done
+    xor ecx, ecx
+.ex_name_loop:
+    cmp ecx, 15
+    jae .ex_sec_done
+    mov ax, [rsi + 2 + rcx*2]
+    test ax, ax
+    jz .ex_sec_done
+    cmp ax, 0x7F
+    jbe .ex_ch_ok
+    mov al, '?'
+.ex_ch_ok:
+    cmp al, 'a'
+    jb .ex_ch_store
+    cmp al, 'z'
+    ja .ex_ch_store
+    sub al, 0x20
+.ex_ch_store:
+    mov ebx, [fs_name_len]
+    cmp ebx, 255
+    jae .ex_name_skip
+    lea rdi, [fs_ex_name_buf]
+    mov [rdi + rbx], al
+.ex_name_skip:
+    inc dword [fs_name_len]
+    inc ecx
+    jmp .ex_name_loop
+.ex_file:
+    mov eax, [fs_entry_off]
+    mov [fs_echo_ex_cand_off], eax
+    mov al, [rsi + 1]                 ; secondary count
+    mov [fs_ex_nrem], al
+    mov byte [fs_ex_active], 1
+    mov dword [fs_name_len], 0
+    jmp .skip
+.ex_sec_done:
+    dec byte [fs_ex_nrem]
+    jnz .skip
+    mov byte [fs_ex_active], 0
+    mov eax, [fs_name_len]
+    cmp eax, [fs_target_raw_len]
+    jne .skip
+    test eax, eax
+    jz .name_match
+    push rcx
+    push rsi
+    push rdi
+    lea rsi, [fs_ex_name_buf]
+    lea rdi, [fs_target_raw]
+    mov ecx, eax
+    repe cmpsb
+    pop rdi
+    pop rsi
+    pop rcx
+    jne .skip
+.name_match:
+    mov eax, [fs_cur_lba]
+    mov [fs_echo_lba], eax
+    mov eax, [fs_echo_ex_cand_off]
+    mov [fs_echo_off], eax
+    mov byte [fs_echo_found], 1
+    stc
+    ret
+.skip:
+    add dword [fs_entry_off], 32
+    jmp .loop
+.not_end:
+    clc
+    ret
+.end_marker:
+    cmp byte [fs_echo_have_slot], 0
+    jne .stop
+    mov eax, [fs_cur_lba]
+    mov [fs_echo_lba], eax
+    mov eax, [fs_entry_off]
+    mov [fs_echo_off], eax
+    mov byte [fs_echo_have_slot], 1
+.stop:
+    stc
+    ret
+
+; --- Allocate one free exFAT cluster for fs_echo_len bytes (0 bytes ->
+; cluster 0) by scanning the allocation bitmap's first cluster only (bounded
+; scan, same rationale as fs_echo_alloc's FAT scan cap - sufficient for
+; typical small volumes). Sets the bit, marks the FAT entry end-of-chain
+; (this driver always walks exFAT files via the FAT chain, ignoring
+; NoFatChain). Result in fs_echo_cluster. CF set on error/no space. ---
+fs_echo_alloc_exfat:
+    mov dword [fs_echo_cluster], 0
+    mov eax, [fs_echo_len]
+    test eax, eax
+    jz .done
+    mov ecx, [fs_spc]
+    shl ecx, 9
+    cmp eax, ecx
+    ja .too_big
+    cmp dword [fs_ex_bitmap_clus], 0
+    je .nospace
+    mov eax, [fs_ex_bitmap_clus]
+    sub eax, 2
+    imul eax, [fs_spc]
+    add eax, [fs_data_lba]
+    mov [fs_cur_lba], eax
+    mov eax, [fs_spc]
+    mov [fs_sec_count], eax
+    mov dword [fs_cat_size], 0        ; global bit index
+.sec_loop:
+    cmp dword [fs_sec_count], 0
+    je .nospace
+    mov eax, [fs_cur_lba]
+    mov edi, FS_SECTOR_BUF
+    call fs_read_sector
+    jc .fail
+    xor ecx, ecx
+.byte_loop:
+    cmp ecx, 512
+    jae .sec_next
+    mov eax, [fs_cat_size]
+    cmp eax, [fs_ex_cluster_count]
+    jae .nospace
+    movzx edx, byte [FS_SECTOR_BUF + rcx]
+    cmp dl, 0xFF
+    je .byte_full
+    xor ebx, ebx
+.bit_loop:
+    cmp ebx, 8
+    jae .byte_full
+    mov eax, [fs_cat_size]
+    add eax, ebx
+    cmp eax, [fs_ex_cluster_count]
+    jae .nospace
+    bt edx, ebx
+    jc .bit_next
+    jmp .found_bit
+.bit_next:
+    inc ebx
+    jmp .bit_loop
+.byte_full:
+    add dword [fs_cat_size], 8
+    inc ecx
+    jmp .byte_loop
+.sec_next:
+    inc dword [fs_cur_lba]
+    dec dword [fs_sec_count]
+    jmp .sec_loop
+.found_bit:
+    mov eax, [fs_cat_size]
+    add eax, ebx
+    add eax, 2
+    mov [fs_echo_cluster], eax
+    bts edx, ebx
+    mov [FS_SECTOR_BUF + rcx], dl
+    mov eax, [fs_cur_lba]
+    mov edi, FS_SECTOR_BUF
+    call fs_write_sector
+    jc .fail
+    mov eax, [fs_echo_cluster]
+    mov ecx, eax
+    shr ecx, 7
+    add ecx, [fs_fat_lba]
+    mov eax, ecx
+    mov edi, FS_FAT_BUF
+    call fs_read_sector
+    jc .fail
+    mov dword [fs_fat_cached], 0xFFFFFFFF
+    mov eax, [fs_echo_cluster]
+    and eax, 127
+    mov dword [FS_FAT_BUF + rax*4], 0x0FFFFFFF
+    mov eax, ecx
+    mov edi, FS_FAT_BUF
+    call fs_write_sector
+    jc .fail
+    clc
+    ret
+.done:
+    clc
+    ret
+.nospace:
+    mov rsi, fs_echo_nospace_msg
+    call print_string
+    mov al, ASCII_CR
+    call print_char
+    stc
+    ret
+.too_big:
+    mov rsi, fs_echo_toobig_msg
+    call print_string
+    mov al, ASCII_CR
+    call print_char
+    stc
+    ret
+.fail:
+    stc
+    ret
+
+; --- Hash fs_target_raw[0..fs_target_raw_len) as exFAT's UTF-16LE name
+; hash (each raw ASCII byte treated as a UTF-16 char with a zero high
+; byte). Result in ax. ---
+fs_exfat_name_hash:
+    xor edx, edx
+    xor ecx, ecx
+    lea rsi, [fs_target_raw]
+    mov ebx, [fs_target_raw_len]
+.loop:
+    cmp ecx, ebx
+    jae .done
+    movzx eax, byte [rsi + rcx]
+    mov r8d, edx
+    and r8d, 1
+    shr edx, 1
+    shl r8d, 15
+    or edx, r8d
+    add edx, eax
+    and edx, 0xFFFF
+    mov r8d, edx
+    and r8d, 1
+    shr edx, 1
+    shl r8d, 15
+    or edx, r8d
+    and edx, 0xFFFF
+    inc ecx
+    jmp .loop
+.done:
+    mov ax, dx
+    ret
+
+; --- Write the 3-entry exFAT directory entry set (file/stream/name) for
+; fs_target_raw/fs_echo_cluster/fs_echo_len at fs_echo_lba/off, computing
+; the SetChecksum field per the exFAT spec. Entries may straddle a sector
+; boundary (one read-modify-write per entry). CF set on I/O error. ---
+fs_echo_write_entry_exfat:
+    lea rdi, [fs_echo_ex_set]
+    mov ecx, 96
+    xor eax, eax
+    rep stosb
+    lea rdi, [fs_echo_ex_set]
+    mov byte [rdi + 0], 0x85
+    mov byte [rdi + 1], 2
+    mov word [rdi + 4], 0x0020        ; ATTR_ARCHIVE
+    mov dword [rdi + 8], 0x00210000   ; CreateTimestamp: 1980-01-01 00:00:00
+    mov dword [rdi + 12], 0x00210000  ; LastModifiedTimestamp
+    mov dword [rdi + 16], 0x00210000  ; LastAccessedTimestamp
+    lea rdi, [fs_echo_ex_set + 32]
+    mov byte [rdi + 0], 0xC0
+    mov byte [rdi + 1], 0x03          ; AllocationPossible, NoFatChain (single contiguous cluster)
+    mov eax, [fs_target_raw_len]
+    mov [rdi + 3], al
+    call fs_exfat_name_hash
+    mov [rdi + 4], ax
+    mov eax, [fs_echo_len]
+    mov [rdi + 8], eax                ; ValidDataLength (low dword)
+    mov eax, [fs_echo_cluster]
+    mov [rdi + 20], eax
+    mov eax, [fs_echo_len]
+    mov [rdi + 24], eax                ; DataLength (low dword)
+    lea rdi, [fs_echo_ex_set + 64]
+    mov byte [rdi + 0], 0xC1
+    mov ecx, [fs_target_raw_len]
+    lea rsi, [fs_target_disp]
+    xor ebx, ebx
+.name_copy:
+    cmp ebx, ecx
+    jae .name_copy_done
+    mov al, [rsi + rbx]
+    mov [rdi + 2 + rbx*2], al
+    mov byte [rdi + 2 + rbx*2 + 1], 0
+    inc ebx
+    jmp .name_copy
+.name_copy_done:
+    xor edx, edx
+    xor ecx, ecx
+    lea rsi, [fs_echo_ex_set]
+.chk_loop:
+    cmp ecx, 96
+    jae .chk_done
+    cmp ecx, 2
+    je .chk_skip
+    cmp ecx, 3
+    je .chk_skip
+    movzx eax, byte [rsi + rcx]
+    mov ebx, edx
+    and ebx, 1
+    shr edx, 1
+    shl ebx, 15
+    or edx, ebx
+    add edx, eax
+    and edx, 0xFFFF
+.chk_skip:
+    inc ecx
+    jmp .chk_loop
+.chk_done:
+    lea rdi, [fs_echo_ex_set]
+    mov [rdi + 2], dx
+    mov dword [fs_echo_ex_i], 0
+.write_loop:
+    mov eax, [fs_echo_ex_i]
+    cmp eax, 3
+    jae .write_done
+    mov eax, [fs_echo_off]
+    shr eax, 5
+    add eax, [fs_echo_ex_i]
+    mov ecx, eax
+    and ecx, 15
+    shl ecx, 5
+    mov [fs_echo_ex_off], ecx
+    shr eax, 4
+    add eax, [fs_echo_lba]
+    mov [fs_echo_ex_lba], eax
+    mov edi, FS_SECTOR_BUF
+    call fs_read_sector
+    jc .fail
+    mov eax, [fs_echo_ex_i]
+    shl eax, 5
+    lea rsi, [fs_echo_ex_set]
+    add rsi, rax
+    mov eax, [fs_echo_ex_off]
+    lea rdi, [FS_SECTOR_BUF]
+    add rdi, rax
+    mov ecx, 32
+    rep movsb
+    mov eax, [fs_echo_ex_lba]
+    mov edi, FS_SECTOR_BUF
+    call fs_write_sector
+    jc .fail
+    inc dword [fs_echo_ex_i]
+    jmp .write_loop
+.write_done:
+    clc
+    ret
+.fail:
+    stc
     ret
 
 ; --- Scan the 16 directory entries in FS_SECTOR_BUF for fs_target_name

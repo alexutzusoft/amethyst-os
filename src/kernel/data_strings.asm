@@ -165,6 +165,17 @@ fs_ex_attr db 0
 fs_ex_nrem db 0
 fs_ex_active db 0
 fs_ex_size dd 0
+fs_ex_cluster_count dd 0
+fs_ex_bitmap_clus dd 0
+fs_ex_root_clus dd 0
+fs_echo_ex_run dd 0
+fs_echo_ex_run_lba dd 0
+fs_echo_ex_run_off dd 0
+fs_echo_ex_cand_off dd 0
+fs_echo_ex_i dd 0
+fs_echo_ex_lba dd 0
+fs_echo_ex_off dd 0
+fs_echo_ex_set times 96 db 0
 fs_gpt_ent_lba dd 0
 fs_gpt_left dd 0
 fs_is_ntfs db 0
@@ -184,6 +195,7 @@ fs_target_name times 11 db 0
 fs_target_case db 0
 fs_target_raw times 255 db 0
 fs_target_raw_len dd 0
+fs_target_disp times 255 db 0
 fs_ex_name_buf times 255 db 0
 fs_cat_found db 0
 fs_cat_cluster dd 0
