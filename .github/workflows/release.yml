@@ -50,8 +50,8 @@ jobs:
             
             # Get the short SHA for the commit
             SHORT_SHA=$(git rev-parse --short "$COMMIT")
-            TAG="nightly-$SHORT_SHA"
-            TITLE="Nightly [$SHORT_SHA]"
+            TAG="$SHORT_SHA"
+            TITLE="$SHORT_SHA"
             
             echo "Building images for tag: $TAG"
             chmod +x tools/build.sh
@@ -85,6 +85,5 @@ jobs:
             gh release create "$TAG" build/amethyst-os.iso build/amethyst-os.img \
               --target "$COMMIT" \
               --title "$TITLE" \
-              --notes-file release_notes.txt \
-              --prerelease
+              --notes-file release_notes.txt
           done
