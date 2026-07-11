@@ -672,6 +672,10 @@ fs_mount:
     imul eax, [fs_spc]
     add eax, [fs_part_lba]
     mov [fs_mft_lba], eax
+    mov eax, [FS_SECTOR_BUF + 56]        ; MFTMirr start cluster (low dword)
+    imul eax, [fs_spc]
+    add eax, [fs_part_lba]
+    mov [fs_mftmirr_lba], eax
     ; file record size (byte 64): >0 = clusters, <0 = 2^-n bytes
     movsx eax, byte [FS_SECTOR_BUF + 64]
     test eax, eax
@@ -1991,7 +1995,7 @@ fs_cat_root:
 ; reported and treated as handled. ---
 fs_echo_root:
     cmp byte [fs_is_ntfs], 0
-    jne .unsupported
+    jne .ntfs
     cmp byte [fs_is_exfat], 0
     jne .exfat
     cmp byte [fs_is_fat32], 0
@@ -2158,6 +2162,10 @@ fs_echo_root:
     ret
 .fail:
     stc
+    ret
+.ntfs:
+    call fs_echo_ntfs
+    clc
     ret
 .unsupported:
     mov rsi, fs_echo_unsupported_msg
@@ -3297,4 +3305,1481 @@ fs_ntfs_cat_data:
     pop rcx
     pop rbx
     pop rax
+    ret
+
+; ============================================================================
+; NTFS write support ("echo <text> > <name>"): overwrite an existing root file
+; (resident $DATA in place) or create a brand-new one (allocate an MFT record
+; via $MFT's $BITMAP, build a FILE record with resident $DATA, insert an entry
+; into root record 5's INDEX_ROOT). Small resident files only (echo <=128 B),
+; root directory only, and only when record 5 has no INDEX_ALLOCATION.
+; ============================================================================
+
+; --- Inverse of fs_apply_fixup: edi=record buffer, ecx=512-byte sector count.
+; Bump the update-sequence number, save each sector's last word into the USA,
+; and stamp the USN into each sector's last word. Call before writing. ---
+fs_write_fixup:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push r9
+    movzx eax, word [rdi + 4]        ; USA offset
+    lea rsi, [rdi + rax]             ; -> USA (check value word first)
+    mov bx, [rsi]
+    inc bx                           ; new update-sequence number
+    mov [rsi], bx
+    add rsi, 2                       ; -> first fixup slot
+    xor edx, edx                     ; sector index
+.loop:
+    test ecx, ecx
+    jz .done
+    mov r9d, edx
+    shl r9d, 9
+    add r9d, 510                     ; last word of this sector
+    mov ax, [rdi + r9]
+    mov [rsi], ax
+    mov [rdi + r9], bx
+    add rsi, 2
+    inc edx
+    dec ecx
+    jmp .loop
+.done:
+    pop r9
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; --- Move ecx bytes within FS_MFT_BUF from offset esi to offset edi, bouncing
+; through FS_INDX_BUF so overlap is safe. ---
+fs_ntfs_shift:
+    push rax
+    push rcx
+    push rdx
+    push r8
+    push r9
+    mov r8d, esi
+    mov r9d, edi
+    xor eax, eax
+.p1:
+    cmp eax, ecx
+    jae .p1d
+    mov dl, [FS_MFT_BUF + r8 + rax]
+    mov [FS_INDX_BUF + rax], dl
+    inc eax
+    jmp .p1
+.p1d:
+    xor eax, eax
+.p2:
+    cmp eax, ecx
+    jae .p2d
+    mov dl, [FS_INDX_BUF + rax]
+    mov [FS_MFT_BUF + r9 + rax], dl
+    inc eax
+    jmp .p2
+.p2d:
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; --- Write FS_MFT_BUF (fs_rec_secs sectors) to [fs_ntfs_rec_lba], applying the
+; write-side fixup first. CF set on error. ---
+fs_ntfs_write_rec:
+    push rax
+    push rcx
+    push rdi
+    mov edi, FS_MFT_BUF
+    mov ecx, [fs_rec_secs]
+    call fs_write_fixup
+    mov eax, [fs_ntfs_rec_lba]
+    call fs_ntfs_flush_rec
+    pop rdi
+    pop rcx
+    pop rax
+    ret
+
+; --- Write FS_MFT_BUF (fs_rec_secs sectors) verbatim to LBA eax (no fixup).
+; CF set on error. ---
+fs_ntfs_flush_rec:
+    push rax
+    push rcx
+    push rdi
+    push r8
+    mov r8d, eax
+    xor ecx, ecx
+.wl:
+    cmp ecx, [fs_rec_secs]
+    jae .wd
+    mov eax, ecx
+    shl eax, 9
+    lea rdi, [FS_MFT_BUF + rax]
+    mov eax, r8d
+    add eax, ecx
+    push rcx
+    call fs_write_sector
+    pop rcx
+    jc .werr
+    inc ecx
+    jmp .wl
+.wd:
+    pop r8
+    pop rdi
+    pop rcx
+    pop rax
+    clc
+    ret
+.werr:
+    pop r8
+    pop rdi
+    pop rcx
+    pop rax
+    stc
+    ret
+
+; --- Find the first zero bit at index >= 24 in the bitmap at rsi (ecx bytes),
+; set it, and return its index in eax. CF set if no free bit found. ---
+fs_ntfs_bitscan:
+    push rbx
+    push rdx
+    push r8
+    mov ebx, 24
+.s:
+    mov eax, ebx
+    shr eax, 3
+    cmp eax, ecx
+    jae .none
+    movzx edx, byte [rsi + rax]
+    mov r8d, ebx
+    and r8d, 7
+    bt edx, r8d
+    jnc .free
+    inc ebx
+    jmp .s
+.free:
+    bts edx, r8d
+    mov [rsi + rax], dl
+    mov eax, ebx
+    pop r8
+    pop rdx
+    pop rbx
+    clc
+    ret
+.none:
+    pop r8
+    pop rdx
+    pop rbx
+    stc
+    ret
+
+; --- Build a $FILE_NAME value (parent = root record 5) at rdi from
+; fs_target_disp/fs_target_raw_len. Returns its length in eax; also stores it
+; in fs_ntfs_fn_len. ---
+fs_ntfs_make_filename:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    mov r8, rdi                      ; base
+    mov edx, [fs_target_raw_len]
+    mov eax, 0x42
+    lea ecx, [rax + rdx*2]           ; total length
+    mov [fs_ntfs_fn_len], ecx
+    ; zero the whole struct
+    push rcx
+    mov rdi, r8
+    xor al, al
+    rep stosb
+    pop rcx
+    mov rdi, r8
+    mov dword [rdi + 0], 5           ; parent record 5
+    mov dword [rdi + 4], 0x00050000  ; parent sequence 5
+    mov eax, [fs_echo_len]
+    mov [rdi + 0x28], eax            ; allocated size (low)
+    mov [rdi + 0x30], eax            ; real size (low)
+    mov dword [rdi + 0x38], 0x20     ; FILE_ATTRIBUTE_ARCHIVE
+    mov eax, [fs_target_raw_len]
+    mov [rdi + 0x40], al             ; name length (chars)
+    mov byte [rdi + 0x41], 1         ; namespace = Win32
+    lea rsi, [fs_target_disp]
+    lea rbx, [rdi + 0x42]
+    xor edx, edx
+.nl:
+    cmp edx, [fs_target_raw_len]
+    jae .nd
+    movzx eax, byte [rsi + rdx]
+    mov [rbx + rdx*2], ax
+    inc edx
+    jmp .nl
+.nd:
+    mov eax, [fs_ntfs_fn_len]
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; --- Debug: print label (rsi) followed by eax as hex and a newline. Preserves
+; all registers, including the xHCI-reserved ones. ---
+fs_ntfs_log:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    mov ebx, eax
+    call print_string
+    mov rax, rbx
+    call print_hex64
+    mov al, ASCII_CR
+    call print_char
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; --- Top-level NTFS echo handler. ---
+fs_echo_ntfs:
+    push rbx
+    mov eax, [fs_echo_len]
+    mov rsi, fs_dbg_echo_msg
+    call fs_ntfs_log
+    mov byte [fs_cat_found], 0
+    call fs_ntfs_list                ; search mode (fs_action==2)
+    jc .err
+    movzx eax, byte [fs_cat_found]
+    mov rsi, fs_dbg_search_msg
+    call fs_ntfs_log
+    cmp byte [fs_cat_found], 0
+    je .create
+    mov eax, [fs_cat_ntfs_ref]
+    mov [fs_ntfs_newref], eax
+    mov rsi, fs_dbg_ow_msg
+    call fs_ntfs_log
+    call fs_ntfs_get_security
+    call fs_ntfs_overwrite
+    jc .err
+    jmp .ok
+.create:
+    call fs_ntfs_get_security
+    xor eax, eax
+    mov rsi, fs_dbg_create_msg
+    call fs_ntfs_log
+    call fs_ntfs_alloc_record
+    jc .err
+    mov eax, [fs_ntfs_newref]
+    mov rsi, fs_dbg_alloc_msg
+    call fs_ntfs_log
+    call fs_ntfs_build_record
+    jc .err
+    call fs_ntfs_index_insert
+    jc .err
+.ok:
+    xor eax, eax
+    mov rsi, fs_dbg_ok_msg
+    call fs_ntfs_log
+    pop rbx
+    ret
+.err:
+    mov rsi, fs_echo_ntfs_err_msg
+    call print_string
+    mov al, ASCII_CR
+    call print_char
+    pop rbx
+    ret
+
+; --- Overwrite an existing file's resident $DATA (record in fs_ntfs_newref)
+; with fs_echo_ptr/fs_echo_len, then patch its index-entry size. CF on error. ---
+fs_ntfs_overwrite:
+    mov eax, [fs_ntfs_newref]
+    imul eax, [fs_rec_secs]
+    add eax, [fs_mft_lba]
+    mov [fs_ntfs_rec_lba], eax
+    mov edi, FS_MFT_BUF
+    call fs_read_run
+    jc .fail
+    cmp dword [FS_MFT_BUF], 0x454C4946
+    jne .fail
+    mov edi, FS_MFT_BUF
+    mov ecx, [fs_rec_secs]
+    call fs_apply_fixup
+    movzx edx, word [FS_MFT_BUF + 20]
+.aloop:
+    cmp edx, 4096
+    jae .fail
+    mov eax, [FS_MFT_BUF + rdx]
+    cmp eax, 0xFFFFFFFF
+    je .fail
+    cmp eax, 0x80
+    jne .anext
+    cmp byte [FS_MFT_BUF + rdx + 9], 0    ; unnamed stream
+    je .found
+.anext:
+    mov eax, [FS_MFT_BUF + rdx + 4]
+    test eax, eax
+    jz .fail
+    add edx, eax
+    jmp .aloop
+.found:
+    cmp byte [FS_MFT_BUF + rdx + 8], 0    ; resident?
+    jne .fail
+    mov eax, edx
+    mov rsi, fs_dbg_ow_data_msg
+    call fs_ntfs_log
+    ; new/old attribute sizes
+    movzx eax, word [FS_MFT_BUF + rdx + 0x14]   ; value offset
+    mov r8d, eax                                ; keep value offset
+    mov ebx, [fs_echo_len]                      ; new value length
+    lea ecx, [rax + rbx]                        ; valoff + newlen
+    add ecx, 7
+    and ecx, 0xFFFFFFF8                          ; new attr length
+    mov r9d, [FS_MFT_BUF + rdx + 4]             ; old attr length
+    ; guard: record must still fit
+    push rdx
+    mov eax, edx
+    add eax, ecx                                ; end of this attr after resize
+    mov edx, [fs_rec_secs]
+    shl edx, 9
+    sub edx, 8
+    cmp eax, edx
+    ja .fail_pop
+    pop rdx
+    ; shift the tail (attrs after this one + end marker) by (new-old)
+    mov esi, edx
+    add esi, r9d                                ; old tail start
+    mov edi, edx
+    add edi, ecx                                ; new tail start
+    push rcx
+    push rdx
+    mov ecx, [FS_MFT_BUF + 0x18]                ; record used size
+    sub ecx, esi                                ; tail length
+    call fs_ntfs_shift
+    pop rdx
+    pop rcx
+    ; new record used size = old + (newattrlen - oldattrlen)
+    mov eax, ecx
+    sub eax, r9d
+    add [FS_MFT_BUF + 0x18], eax
+    ; write the new value bytes
+    mov eax, [fs_echo_len]
+    test eax, eax
+    jz .noval
+    push rcx
+    lea rdi, [FS_MFT_BUF + rdx]
+    add rdi, r8                                 ; -> value
+    mov rsi, [fs_echo_ptr]
+    mov ecx, eax
+    rep movsb
+    pop rcx
+.noval:
+    mov eax, [fs_echo_len]
+    mov [FS_MFT_BUF + rdx + 0x10], eax          ; value length
+    mov [FS_MFT_BUF + rdx + 4], ecx             ; attr length
+    ; patch this record's $FILE_NAME sizes too
+    call fs_ntfs_patch_fn_size
+    call fs_ntfs_fix_security
+    jc .fail
+    mov eax, [FS_MFT_BUF + 0x18]
+    mov rsi, fs_dbg_ow_wrote_msg
+    call fs_ntfs_log
+    call fs_ntfs_write_rec
+    jc .fail
+    call fs_ntfs_patch_index
+    clc
+    ret
+.fail_pop:
+    pop rdx
+.fail:
+    stc
+    ret
+
+; --- Set the $FILE_NAME (0x30) real+allocated size in the record now in
+; FS_MFT_BUF to fs_echo_len. ---
+fs_ntfs_patch_fn_size:
+    push rax
+    push rdx
+    movzx edx, word [FS_MFT_BUF + 20]
+.loop:
+    cmp edx, 4096
+    jae .done
+    mov eax, [FS_MFT_BUF + rdx]
+    cmp eax, 0xFFFFFFFF
+    je .done
+    cmp eax, 0x30
+    je .found
+    mov eax, [FS_MFT_BUF + rdx + 4]
+    test eax, eax
+    jz .done
+    add edx, eax
+    jmp .loop
+.found:
+    movzx eax, word [FS_MFT_BUF + rdx + 0x14]   ; value offset
+    add edx, eax                                ; -> FILE_NAME value
+    mov eax, [fs_echo_len]
+    mov [FS_MFT_BUF + rdx + 0x28], eax
+    mov dword [FS_MFT_BUF + rdx + 0x2C], 0
+    mov [FS_MFT_BUF + rdx + 0x30], eax
+    mov dword [FS_MFT_BUF + rdx + 0x34], 0
+.done:
+    pop rdx
+    pop rax
+    ret
+
+; --- Update the root INDEX_ROOT entry matching fs_target_raw with the new
+; size (fs_echo_len). Best-effort (INDEX_ROOT only); ignores errors. ---
+fs_ntfs_patch_index:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r9
+    mov eax, 5
+    imul eax, [fs_rec_secs]
+    add eax, [fs_mft_lba]
+    mov [fs_ntfs_rec_lba], eax
+    mov edi, FS_MFT_BUF
+    call fs_read_run
+    jc .done
+    cmp dword [FS_MFT_BUF], 0x454C4946
+    jne .done
+    mov edi, FS_MFT_BUF
+    mov ecx, [fs_rec_secs]
+    call fs_apply_fixup
+    movzx edx, word [FS_MFT_BUF + 20]
+.find90:
+    cmp edx, 4096
+    jae .done
+    mov eax, [FS_MFT_BUF + rdx]
+    cmp eax, 0xFFFFFFFF
+    je .done
+    cmp eax, 0x90
+    je .have90
+    mov eax, [FS_MFT_BUF + rdx + 4]
+    test eax, eax
+    jz .done
+    add edx, eax
+    jmp .find90
+.have90:
+    movzx eax, word [FS_MFT_BUF + rdx + 0x14]
+    mov r9d, edx
+    add r9d, eax                                ; INDEX_ROOT value offset
+    mov esi, r9d
+    add esi, 16
+    add esi, [FS_MFT_BUF + r9 + 16]             ; first entry offset
+.ewalk:
+    movzx eax, word [FS_MFT_BUF + rsi + 12]     ; flags
+    test al, 0x02
+    jnz .write                                  ; end entry -> no match, still rewrite (harmless)
+    ; compare name
+    movzx ecx, byte [FS_MFT_BUF + rsi + 16 + 0x40]
+    cmp ecx, [fs_target_raw_len]
+    jne .enext
+    lea rbx, [FS_MFT_BUF + rsi + 16 + 0x42]
+    lea rdi, [fs_target_raw]
+    xor edx, edx
+.cmp:
+    cmp edx, ecx
+    jae .match
+    movzx eax, word [rbx + rdx*2]
+    cmp eax, 0x7F
+    jbe .cok
+    mov eax, '?'
+.cok:
+    cmp al, 'a'
+    jb .chave
+    cmp al, 'z'
+    ja .chave
+    sub al, 0x20
+.chave:
+    cmp al, [rdi + rdx]
+    jne .enext
+    inc edx
+    jmp .cmp
+.match:
+    mov eax, [fs_echo_len]
+    mov [FS_MFT_BUF + rsi + 16 + 0x28], eax
+    mov dword [FS_MFT_BUF + rsi + 16 + 0x2C], 0
+    mov [FS_MFT_BUF + rsi + 16 + 0x30], eax
+    mov dword [FS_MFT_BUF + rsi + 16 + 0x34], 0
+    jmp .write
+.enext:
+    movzx eax, word [FS_MFT_BUF + rsi + 8]
+    test eax, eax
+    jz .write
+    add esi, eax
+    jmp .ewalk
+.write:
+    call fs_ntfs_write_rec
+.done:
+    pop r9
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+fs_ntfs_fix_security:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    movzx edx, word [FS_MFT_BUF + 20]
+.find10:
+    cmp edx, 4096
+    jae .fail
+    mov eax, [FS_MFT_BUF + rdx]
+    cmp eax, 0xFFFFFFFF
+    je .fail
+    cmp eax, 0x10
+    je .have10
+    mov eax, [FS_MFT_BUF + rdx + 4]
+    test eax, eax
+    jz .fail
+    add edx, eax
+    jmp .find10
+.have10:
+    cmp dword [FS_MFT_BUF + rdx + 0x10], 0x48
+    jae .sethave
+    mov r9d, [FS_MFT_BUF + rdx + 4]
+    mov eax, [FS_MFT_BUF + 0x18]
+    add eax, 0x60
+    sub eax, r9d
+    mov ebx, [fs_rec_secs]
+    shl ebx, 9
+    sub ebx, 8
+    cmp eax, ebx
+    ja .fail
+    mov esi, edx
+    add esi, r9d
+    mov edi, edx
+    add edi, 0x60
+    mov ecx, [FS_MFT_BUF + 0x18]
+    sub ecx, esi
+    call fs_ntfs_shift
+    mov eax, 0x60
+    sub eax, r9d
+    add [FS_MFT_BUF + 0x18], eax
+    lea rdi, [FS_MFT_BUF + rdx]
+    add rdi, r9
+    mov ecx, 0x60
+    sub ecx, r9d
+    xor al, al
+    rep stosb
+    mov dword [FS_MFT_BUF + rdx + 4], 0x60
+    mov dword [FS_MFT_BUF + rdx + 0x10], 0x48
+.sethave:
+    movzx eax, word [FS_MFT_BUF + rdx + 0x14]
+    add eax, edx
+    cmp dword [FS_MFT_BUF + rax + 0x34], 0
+    jne .done
+    mov ebx, [fs_ntfs_secid]
+    mov [FS_MFT_BUF + rax + 0x34], ebx
+    test ebx, ebx
+    jnz .done
+    movzx edx, word [FS_MFT_BUF + 20]
+.find50:
+    cmp edx, 4096
+    jae .fail
+    mov eax, [FS_MFT_BUF + rdx]
+    cmp eax, 0xFFFFFFFF
+    je .fail
+    cmp eax, 0x50
+    je .done
+    ja .insert
+    mov eax, [FS_MFT_BUF + rdx + 4]
+    test eax, eax
+    jz .fail
+    add edx, eax
+    jmp .find50
+.insert:
+    mov ecx, [fs_ntfs_sd_len]
+    test ecx, ecx
+    jz .done
+    mov eax, [FS_MFT_BUF + 0x18]
+    add eax, ecx
+    mov ebx, [fs_rec_secs]
+    shl ebx, 9
+    sub ebx, 8
+    cmp eax, ebx
+    ja .fail
+    mov esi, edx
+    mov edi, edx
+    add edi, ecx
+    mov ecx, [FS_MFT_BUF + 0x18]
+    sub ecx, esi
+    call fs_ntfs_shift
+    mov ecx, [fs_ntfs_sd_len]
+    lea rdi, [FS_MFT_BUF + rdx]
+    lea rsi, [fs_ntfs_sd_buf]
+    rep movsb
+    movzx eax, word [FS_MFT_BUF + 0x28]
+    mov [FS_MFT_BUF + rdx + 0x0E], ax
+    inc eax
+    mov [FS_MFT_BUF + 0x28], ax
+    mov eax, [fs_ntfs_sd_len]
+    add [FS_MFT_BUF + 0x18], eax
+.done:
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    clc
+    ret
+.fail:
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    stc
+    ret
+
+fs_ntfs_get_security:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    mov dword [fs_ntfs_secid], 0
+    mov dword [fs_ntfs_sd_len], 0
+    mov eax, 5
+    imul eax, [fs_rec_secs]
+    add eax, [fs_mft_lba]
+    mov edi, FS_MFT_BUF
+    call fs_read_run
+    jc .done
+    cmp dword [FS_MFT_BUF], 0x454C4946
+    jne .done
+    mov edi, FS_MFT_BUF
+    mov ecx, [fs_rec_secs]
+    call fs_apply_fixup
+    movzx edx, word [FS_MFT_BUF + 20]
+.loop:
+    cmp edx, 4096
+    jae .done
+    mov eax, [FS_MFT_BUF + rdx]
+    cmp eax, 0xFFFFFFFF
+    je .done
+    cmp eax, 0x10
+    je .si
+    cmp eax, 0x50
+    je .sd
+.next:
+    mov eax, [FS_MFT_BUF + rdx + 4]
+    test eax, eax
+    jz .done
+    add edx, eax
+    jmp .loop
+.si:
+    cmp byte [FS_MFT_BUF + rdx + 8], 0
+    jne .next
+    cmp dword [FS_MFT_BUF + rdx + 0x10], 0x48
+    jb .next
+    movzx eax, word [FS_MFT_BUF + rdx + 0x14]
+    add eax, edx
+    mov ebx, [FS_MFT_BUF + rax + 0x34]
+    mov [fs_ntfs_secid], ebx
+    jmp .next
+.sd:
+    cmp byte [FS_MFT_BUF + rdx + 8], 0
+    jne .next
+    cmp byte [FS_MFT_BUF + rdx + 9], 0
+    jne .next
+    mov ecx, [FS_MFT_BUF + rdx + 4]
+    cmp ecx, 256
+    ja .next
+    mov [fs_ntfs_sd_len], ecx
+    lea rsi, [FS_MFT_BUF + rdx]
+    lea rdi, [fs_ntfs_sd_buf]
+    rep movsb
+    jmp .next
+.done:
+    cmp dword [fs_ntfs_secid], 0
+    jne .out
+    cmp dword [fs_ntfs_sd_len], 0
+    jne .out
+    lea rdi, [fs_ntfs_sd_buf]
+    xor al, al
+    mov ecx, 0x68
+    rep stosb
+    lea rdi, [fs_ntfs_sd_buf]
+    mov dword [rdi + 0], 0x50
+    mov dword [rdi + 4], 0x68
+    mov dword [rdi + 0x10], 80
+    mov word [rdi + 0x14], 0x18
+    lea rsi, [fs_ntfs_def_sd]
+    lea rdi, [fs_ntfs_sd_buf + 0x18]
+    mov ecx, 80
+    rep movsb
+    mov dword [fs_ntfs_sd_len], 0x68
+.out:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+fs_ntfs_cover_ref:
+    push rbx
+    push rdx
+    mov eax, [fs_ntfs_newref]
+    inc eax
+    imul eax, [fs_rec_secs]
+    shl eax, 9
+    movzx edx, word [FS_MFT_BUF + 20]
+.loop:
+    cmp edx, 4096
+    jae .fail
+    mov ebx, [FS_MFT_BUF + rdx]
+    cmp ebx, 0xFFFFFFFF
+    je .fail
+    cmp ebx, 0x80
+    je .found
+    mov ebx, [FS_MFT_BUF + rdx + 4]
+    test ebx, ebx
+    jz .fail
+    add edx, ebx
+    jmp .loop
+.found:
+    cmp byte [FS_MFT_BUF + rdx + 8], 0
+    je .no
+    cmp dword [FS_MFT_BUF + rdx + 0x34], 0
+    jne .no
+    cmp eax, [FS_MFT_BUF + rdx + 0x30]
+    jbe .no
+    cmp dword [FS_MFT_BUF + rdx + 0x2C], 0
+    jne .grow
+    cmp eax, [FS_MFT_BUF + rdx + 0x28]
+    ja .fail
+.grow:
+    mov [FS_MFT_BUF + rdx + 0x30], eax
+    mov [FS_MFT_BUF + rdx + 0x38], eax
+    mov eax, 1
+    pop rdx
+    pop rbx
+    clc
+    ret
+.no:
+    xor eax, eax
+    pop rdx
+    pop rbx
+    clc
+    ret
+.fail:
+    pop rdx
+    pop rbx
+    stc
+    ret
+
+; --- Allocate a free MFT record via $MFT's $BITMAP (record 0). Sets
+; fs_ntfs_newref. CF on error. ---
+fs_ntfs_alloc_record:
+    mov eax, 0                       ; MFT record 0 = $MFT
+    imul eax, [fs_rec_secs]
+    add eax, [fs_mft_lba]
+    mov edi, FS_MFT_BUF
+    call fs_read_run
+    jc .fail
+    cmp dword [FS_MFT_BUF], 0x454C4946
+    jne .fail
+    mov edi, FS_MFT_BUF
+    mov ecx, [fs_rec_secs]
+    call fs_apply_fixup
+    movzx edx, word [FS_MFT_BUF + 20]
+.aloop:
+    cmp edx, 4096
+    jae .fail
+    mov eax, [FS_MFT_BUF + rdx]
+    cmp eax, 0xFFFFFFFF
+    je .fail
+    cmp eax, 0xB0                    ; $BITMAP
+    je .found
+    mov eax, [FS_MFT_BUF + rdx + 4]
+    test eax, eax
+    jz .fail
+    add edx, eax
+    jmp .aloop
+.found:
+    cmp byte [FS_MFT_BUF + rdx + 8], 0    ; resident?
+    jne .nonres
+    movzx eax, word [FS_MFT_BUF + rdx + 0x14]   ; value offset
+    mov ecx, [FS_MFT_BUF + rdx + 0x10]          ; value length (bytes)
+    lea rsi, [FS_MFT_BUF + rdx]
+    add rsi, rax
+    call fs_ntfs_bitscan
+    jc .fail
+    mov [fs_ntfs_newref], eax
+    call fs_ntfs_cover_ref
+    jc .fail
+    ; rewrite record 0 (bitmap lives inside it)
+    mov eax, 0
+    imul eax, [fs_rec_secs]
+    add eax, [fs_mft_lba]
+    mov [fs_ntfs_rec_lba], eax
+    call fs_ntfs_write_rec
+    jc .fail
+    ; mirror record 0 into $MFTMirr (records 0-3 are mirrored)
+    mov eax, [fs_mftmirr_lba]
+    call fs_ntfs_flush_rec
+    ret
+.nonres:
+    ; decode the first data run of the non-resident $BITMAP, read one sector
+    movzx eax, word [FS_MFT_BUF + rdx + 0x20]   ; run list offset
+    add eax, edx
+    movzx ecx, byte [FS_MFT_BUF + rax]          ; run header
+    test cl, cl
+    jz .fail
+    inc eax
+    mov ebx, ecx
+    and ebx, 0x0F                               ; length field size
+    mov r8d, ecx
+    shr r8d, 4                                  ; offset field size
+    add eax, ebx                                ; skip length bytes
+    ; read offset (LCN, assume positive) into r9d
+    xor r9d, r9d
+    xor ecx, ecx                                ; shift
+.off:
+    test r8d, r8d
+    jz .offd
+    movzx edx, byte [FS_MFT_BUF + rax]
+    shl edx, cl
+    or r9d, edx
+    add ecx, 8
+    inc eax
+    dec r8d
+    jmp .off
+.offd:
+    mov eax, r9d                                 ; LCN
+    imul eax, [fs_spc]
+    add eax, [fs_part_lba]
+    mov [fs_ntfs_rec_lba], eax                   ; reuse as bitmap sector LBA
+    mov edi, FS_SECTOR_BUF
+    call fs_read_sector
+    jc .fail
+    mov ecx, 512
+    lea rsi, [FS_SECTOR_BUF]
+    call fs_ntfs_bitscan
+    jc .fail
+    mov [fs_ntfs_newref], eax
+    mov eax, [fs_ntfs_rec_lba]
+    mov edi, FS_SECTOR_BUF
+    call fs_write_sector
+    jc .fail
+    call fs_ntfs_cover_ref
+    jc .fail
+    test eax, eax
+    jz .nogrow
+    mov eax, [fs_mft_lba]
+    mov [fs_ntfs_rec_lba], eax
+    call fs_ntfs_write_rec
+    jc .fail
+    mov eax, [fs_mftmirr_lba]
+    call fs_ntfs_flush_rec
+    ret
+.nogrow:
+    clc
+    ret
+.fail:
+    stc
+    ret
+
+; --- Build a new FILE record (record fs_ntfs_newref) in FS_MFT_BUF with
+; $STANDARD_INFORMATION, $FILE_NAME and resident $DATA, then write it. ---
+fs_ntfs_build_record:
+    ; zero the whole record
+    mov eax, [fs_rec_secs]
+    shl eax, 9
+    mov ecx, eax
+    lea rdi, [FS_MFT_BUF]
+    xor al, al
+    rep stosb
+    ; header
+    mov dword [FS_MFT_BUF + 0], 0x454C4946       ; "FILE"
+    mov word [FS_MFT_BUF + 4], 0x30              ; USA offset
+    mov eax, [fs_rec_secs]
+    inc eax
+    mov [FS_MFT_BUF + 6], ax                     ; USA count
+    mov word [FS_MFT_BUF + 0x10], 1              ; sequence number
+    mov word [FS_MFT_BUF + 0x12], 1              ; hard link count
+    mov eax, [fs_rec_secs]
+    inc eax
+    shl eax, 1
+    add eax, 0x30
+    add eax, 7
+    and eax, 0xFFFFFFF8                          ; first attribute offset
+    mov [FS_MFT_BUF + 0x14], ax
+    mov r8d, eax                                 ; write cursor
+    mov word [FS_MFT_BUF + 0x16], 1              ; flags: in use
+    mov eax, [fs_rec_secs]
+    shl eax, 9
+    mov [FS_MFT_BUF + 0x1C], eax                 ; allocated size
+    mov word [FS_MFT_BUF + 0x28], 4              ; next attribute id
+    mov eax, [fs_ntfs_newref]
+    mov [FS_MFT_BUF + 0x2C], eax                 ; record number
+    ; $STANDARD_INFORMATION (0x10)
+    mov dword [FS_MFT_BUF + r8 + 0], 0x10
+    mov dword [FS_MFT_BUF + r8 + 4], 0x60
+    mov byte [FS_MFT_BUF + r8 + 8], 0
+    mov byte [FS_MFT_BUF + r8 + 9], 0
+    mov word [FS_MFT_BUF + r8 + 0x0A], 0
+    mov word [FS_MFT_BUF + r8 + 0x0C], 0
+    mov word [FS_MFT_BUF + r8 + 0x0E], 0
+    mov dword [FS_MFT_BUF + r8 + 0x10], 0x48
+    mov word [FS_MFT_BUF + r8 + 0x14], 0x18
+    mov word [FS_MFT_BUF + r8 + 0x16], 0
+    mov dword [FS_MFT_BUF + r8 + 0x38], 0x20     ; value+0x20 = flags (archive)
+    mov eax, [fs_ntfs_secid]
+    mov [FS_MFT_BUF + r8 + 0x4C], eax
+    add r8d, 0x60
+    ; $FILE_NAME (0x30)
+    lea rdi, [fs_ex_name_buf]
+    call fs_ntfs_make_filename                    ; -> fs_ntfs_fn_len
+    mov dword [FS_MFT_BUF + r8 + 0], 0x30
+    mov eax, [fs_ntfs_fn_len]
+    lea ebx, [rax + 0x18]
+    add ebx, 7
+    and ebx, 0xFFFFFFF8
+    mov [FS_MFT_BUF + r8 + 4], ebx
+    mov byte [FS_MFT_BUF + r8 + 8], 0
+    mov byte [FS_MFT_BUF + r8 + 9], 0
+    mov word [FS_MFT_BUF + r8 + 0x0A], 0
+    mov word [FS_MFT_BUF + r8 + 0x0C], 0
+    mov word [FS_MFT_BUF + r8 + 0x0E], 1
+    mov [FS_MFT_BUF + r8 + 0x10], eax
+    mov word [FS_MFT_BUF + r8 + 0x14], 0x18
+    mov byte [FS_MFT_BUF + r8 + 0x16], 1         ; indexed
+    mov byte [FS_MFT_BUF + r8 + 0x17], 0
+    lea rdi, [FS_MFT_BUF + r8 + 0x18]
+    lea rsi, [fs_ex_name_buf]
+    mov ecx, [fs_ntfs_fn_len]
+    rep movsb
+    add r8d, ebx
+    mov ecx, [fs_ntfs_sd_len]
+    test ecx, ecx
+    jz .nosd
+    lea rdi, [FS_MFT_BUF + r8]
+    lea rsi, [fs_ntfs_sd_buf]
+    rep movsb
+    mov word [FS_MFT_BUF + r8 + 0x0E], 3
+    add r8d, [fs_ntfs_sd_len]
+.nosd:
+    ; $DATA (0x80), resident
+    mov dword [FS_MFT_BUF + r8 + 0], 0x80
+    mov eax, [fs_echo_len]
+    lea ebx, [rax + 0x18]
+    add ebx, 7
+    and ebx, 0xFFFFFFF8
+    mov [FS_MFT_BUF + r8 + 4], ebx
+    mov byte [FS_MFT_BUF + r8 + 8], 0
+    mov byte [FS_MFT_BUF + r8 + 9], 0
+    mov word [FS_MFT_BUF + r8 + 0x0A], 0
+    mov word [FS_MFT_BUF + r8 + 0x0C], 0
+    mov word [FS_MFT_BUF + r8 + 0x0E], 2
+    mov [FS_MFT_BUF + r8 + 0x10], eax
+    mov word [FS_MFT_BUF + r8 + 0x14], 0x18
+    mov word [FS_MFT_BUF + r8 + 0x16], 0
+    mov eax, [fs_echo_len]
+    test eax, eax
+    jz .nodata
+    lea rdi, [FS_MFT_BUF + r8 + 0x18]
+    mov rsi, [fs_echo_ptr]
+    mov ecx, eax
+    rep movsb
+.nodata:
+    add r8d, ebx
+    ; end marker
+    mov dword [FS_MFT_BUF + r8], 0xFFFFFFFF
+    mov dword [FS_MFT_BUF + r8 + 4], 0
+    add r8d, 8
+    mov [FS_MFT_BUF + 0x18], r8d                 ; used size
+    mov eax, r8d
+    mov rsi, fs_dbg_built_msg
+    call fs_ntfs_log
+    ; write it
+    mov eax, [fs_ntfs_newref]
+    imul eax, [fs_rec_secs]
+    add eax, [fs_mft_lba]
+    mov [fs_ntfs_rec_lba], eax
+    call fs_ntfs_write_rec
+    ret
+
+; --- Insert the new file's entry into root record 5's INDEX_ROOT. Bails (with
+; a message, no error) if record 5 has an INDEX_ALLOCATION. CF on I/O error. ---
+fs_ntfs_index_insert:
+    mov eax, 5
+    imul eax, [fs_rec_secs]
+    add eax, [fs_mft_lba]
+    mov [fs_ntfs_rec_lba], eax
+    mov edi, FS_MFT_BUF
+    call fs_read_run
+    jc .fail
+    cmp dword [FS_MFT_BUF], 0x454C4946
+    jne .fail
+    mov edi, FS_MFT_BUF
+    mov ecx, [fs_rec_secs]
+    call fs_apply_fixup
+    ; new entry length = align8(16 + fn_len)
+    mov eax, [fs_ntfs_fn_len]
+    add eax, 16
+    add eax, 7
+    and eax, 0xFFFFFFF8
+    mov [fs_ntfs_ent_len], eax
+    ; pass 1: if there is an INDEX_ALLOCATION (0xA0), insert into an INDX block
+    movzx edx, word [FS_MFT_BUF + 20]
+.p1:
+    cmp edx, 4096
+    jae .p1d
+    mov eax, [FS_MFT_BUF + rdx]
+    cmp eax, 0xFFFFFFFF
+    je .p1d
+    cmp eax, 0xA0
+    je .use_alloc
+    mov eax, [FS_MFT_BUF + rdx + 4]
+    test eax, eax
+    jz .p1d
+    add edx, eax
+    jmp .p1
+.use_alloc:
+    mov eax, [fs_ntfs_ent_len]
+    mov rsi, fs_dbg_indx_msg
+    call fs_ntfs_log
+    call fs_ntfs_indx_insert                     ; edx = 0xA0 attr offset
+    jc .fail
+    test eax, eax
+    jz .bigdir                                   ; no INDX block had room
+    ret
+.p1d:
+    ; pass 2: find INDEX_ROOT (0x90)
+    movzx edx, word [FS_MFT_BUF + 20]
+.p2:
+    cmp edx, 4096
+    jae .fail
+    mov eax, [FS_MFT_BUF + rdx]
+    cmp eax, 0xFFFFFFFF
+    je .fail
+    cmp eax, 0x90
+    je .have90
+    mov eax, [FS_MFT_BUF + rdx + 4]
+    test eax, eax
+    jz .fail
+    add edx, eax
+    jmp .p2
+.have90:
+    movzx eax, word [FS_MFT_BUF + rdx + 0x14]
+    mov r9d, edx
+    add r9d, eax                                 ; INDEX_ROOT value offset
+    mov esi, r9d
+    add esi, 16
+    add esi, [FS_MFT_BUF + r9 + 16]              ; first entry offset
+.ewalk:
+    movzx eax, word [FS_MFT_BUF + rsi + 12]      ; flags
+    test al, 0x02
+    jnz .atend
+    lea rax, [FS_MFT_BUF + rsi]
+    push rsi
+    mov rsi, rax
+    call fs_ntfs_ins_here
+    pop rsi
+    test eax, eax
+    jnz .atend                                   ; sorted insertion point
+    movzx eax, word [FS_MFT_BUF + rsi + 8]
+    test eax, eax
+    jz .atend
+    add esi, eax
+    jmp .ewalk
+.atend:
+    ; guard: fits?
+    mov eax, [FS_MFT_BUF + 0x18]
+    add eax, [fs_ntfs_ent_len]
+    mov ebx, [fs_rec_secs]
+    shl ebx, 9
+    sub ebx, 8
+    cmp eax, ebx
+    ja .bigdir
+    mov eax, [fs_ntfs_ent_len]
+    mov rsi, fs_dbg_insert_msg
+    call fs_ntfs_log
+    ; shift tail (from insertion point esi) up by ent_len
+    mov ecx, [FS_MFT_BUF + 0x18]
+    sub ecx, esi
+    mov edi, esi
+    add edi, [fs_ntfs_ent_len]
+    push rsi
+    call fs_ntfs_shift                           ; esi=src, edi=dst, ecx=len
+    pop rsi
+    ; write the new entry at esi
+    mov eax, [fs_ntfs_newref]
+    mov [FS_MFT_BUF + rsi + 0], eax
+    mov dword [FS_MFT_BUF + rsi + 4], 0x00010000 ; sequence 1
+    mov eax, [fs_ntfs_ent_len]
+    mov [FS_MFT_BUF + rsi + 8], ax
+    mov eax, [fs_ntfs_fn_len]
+    mov [FS_MFT_BUF + rsi + 10], ax
+    mov word [FS_MFT_BUF + rsi + 12], 0
+    mov word [FS_MFT_BUF + rsi + 14], 0
+    lea rdi, [FS_MFT_BUF + rsi + 16]
+    lea rsi, [fs_ex_name_buf]
+    mov ecx, [fs_ntfs_fn_len]
+    rep movsb
+    ; grow sizes by ent_len
+    mov eax, [fs_ntfs_ent_len]
+    add [FS_MFT_BUF + r9 + 16 + 4], eax          ; node used
+    add [FS_MFT_BUF + r9 + 16 + 8], eax          ; node allocated
+    add [FS_MFT_BUF + rdx + 0x10], eax           ; attr value length
+    add [FS_MFT_BUF + rdx + 4], eax              ; attr length
+    add [FS_MFT_BUF + 0x18], eax                 ; record used size
+    call fs_ntfs_write_rec
+    ret
+.bigdir:
+    xor eax, eax
+    mov rsi, fs_dbg_bigdir_msg
+    call fs_ntfs_log
+    mov rsi, fs_echo_ntfs_bigdir_msg
+    call print_string
+    mov al, ASCII_CR
+    call print_char
+    clc
+    ret
+.fail:
+    stc
+    ret
+
+; --- Overlap-safe backward byte move within FS_INDX_BUF (dst >= src):
+; esi=src offset, edi=dst offset, ecx=length. ---
+fs_ntfs_shift_indx:
+    push rax
+    push rdx
+    push r8
+    push r9
+    mov r8d, esi
+    mov r9d, edi
+    mov eax, ecx
+.l:
+    test eax, eax
+    jz .d
+    dec eax
+    mov dl, [FS_INDX_BUF + r8 + rax]
+    mov [FS_INDX_BUF + r9 + rax], dl
+    jmp .l
+.d:
+    pop r9
+    pop r8
+    pop rdx
+    pop rax
+    ret
+
+; --- Write FS_INDX_BUF (fs_indx_secs sectors) to LBA eax, applying the
+; write-side fixup first. CF set on error. ---
+fs_ntfs_write_indx:
+    push rax
+    push rcx
+    push rdx
+    push rdi
+    push r8
+    mov r8d, eax
+    mov edi, FS_INDX_BUF
+    mov ecx, [fs_indx_secs]
+    call fs_write_fixup
+    xor ecx, ecx
+.wl:
+    cmp ecx, [fs_indx_secs]
+    jae .wd
+    mov eax, ecx
+    shl eax, 9
+    lea rdi, [FS_INDX_BUF + rax]
+    mov eax, r8d
+    add eax, ecx
+    push rcx
+    call fs_write_sector
+    pop rcx
+    jc .werr
+    inc ecx
+    jmp .wl
+.wd:
+    pop r8
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rax
+    clc
+    ret
+.werr:
+    pop r8
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rax
+    stc
+    ret
+
+; --- Try to insert the new entry into the INDX block currently in FS_INDX_BUF
+; (fixup already applied). Returns eax=1 if inserted (block modified), eax=0 if
+; the block had no room. ---
+fs_ntfs_try_block:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    mov esi, 0x18
+    add esi, [FS_INDX_BUF + 0x18 + 0]            ; -> first index entry
+.walk:
+    movzx eax, word [FS_INDX_BUF + rsi + 12]     ; flags
+    test al, 0x02                                ; last (end) entry
+    jnz .atend
+    lea rax, [FS_INDX_BUF + rsi]
+    push rsi
+    mov rsi, rax
+    call fs_ntfs_ins_here
+    pop rsi
+    test eax, eax
+    jnz .atend                                   ; sorted insertion point
+    movzx eax, word [FS_INDX_BUF + rsi + 8]
+    test eax, eax
+    jz .atend
+    add esi, eax
+    jmp .walk
+.atend:
+    ; room check: node used + entlen <= node allocated (both rel to 0x18)
+    mov eax, [FS_INDX_BUF + 0x18 + 4]
+    add eax, [fs_ntfs_ent_len]
+    cmp eax, [FS_INDX_BUF + 0x18 + 8]
+    ja .noroom
+    ; tail length = (0x18 + used) - insertion offset
+    mov ecx, 0x18
+    add ecx, [FS_INDX_BUF + 0x18 + 4]
+    sub ecx, esi
+    mov edi, esi
+    add edi, [fs_ntfs_ent_len]
+    push rsi
+    call fs_ntfs_shift_indx
+    pop rsi
+    mov eax, [fs_ntfs_newref]
+    mov [FS_INDX_BUF + rsi + 0], eax
+    mov dword [FS_INDX_BUF + rsi + 4], 0x00010000
+    mov eax, [fs_ntfs_ent_len]
+    mov [FS_INDX_BUF + rsi + 8], ax
+    mov eax, [fs_ntfs_fn_len]
+    mov [FS_INDX_BUF + rsi + 10], ax
+    mov word [FS_INDX_BUF + rsi + 12], 0
+    mov word [FS_INDX_BUF + rsi + 14], 0
+    lea rdi, [FS_INDX_BUF + rsi + 16]
+    lea rsi, [fs_ex_name_buf]
+    mov ecx, [fs_ntfs_fn_len]
+    rep movsb
+    mov eax, [fs_ntfs_ent_len]
+    add [FS_INDX_BUF + 0x18 + 4], eax            ; grow node used size
+    mov eax, 1
+    jmp .out
+.noroom:
+    xor eax, eax
+.out:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; --- Insert the new entry into an INDEX_ALLOCATION INDX block. edx = 0xA0 attr
+; offset in FS_MFT_BUF (record 5). Walks the attribute's data runs, reading each
+; INDX block, and inserts into the first block with room. Returns eax=1 if
+; inserted, eax=0 if no block had room; CF set on I/O error. ---
+fs_ntfs_indx_insert:
+    movzx eax, word [FS_MFT_BUF + rdx + 0x20]    ; runs offset
+    add eax, edx
+    mov [fs_run_ptr], eax
+    mov dword [fs_run_lcn], 0
+.run_loop:
+    mov eax, [fs_run_ptr]
+    movzx ecx, byte [FS_MFT_BUF + rax]
+    test cl, cl
+    jz .none
+    inc eax
+    mov ebx, ecx
+    and ebx, 0x0F
+    mov edx, ecx
+    shr edx, 4
+    xor r8d, r8d
+    xor r9d, r9d
+.len:
+    test ebx, ebx
+    jz .lend
+    movzx ecx, byte [FS_MFT_BUF + rax]
+    mov esi, ecx
+    mov ecx, r9d
+    shl esi, cl
+    or r8d, esi
+    add r9d, 8
+    inc eax
+    dec ebx
+    jmp .len
+.lend:
+    mov [fs_run_len], r8d
+    xor r8d, r8d
+    xor r9d, r9d
+    mov edi, edx
+.off:
+    test edx, edx
+    jz .offd
+    movzx ecx, byte [FS_MFT_BUF + rax]
+    mov esi, ecx
+    mov ecx, r9d
+    shl esi, cl
+    or r8d, esi
+    add r9d, 8
+    inc eax
+    dec edx
+    jmp .off
+.offd:
+    test edi, edi
+    jz .after                                    ; sparse run: skip
+    mov ecx, edi
+    shl ecx, 3
+    cmp ecx, 32
+    jae .nosext
+    mov edx, 1
+    dec ecx
+    shl edx, cl
+    test r8d, edx
+    jz .nosext
+    mov ecx, edi
+    shl ecx, 3
+    mov edx, 0xFFFFFFFF
+    shl edx, cl
+    or r8d, edx
+.nosext:
+    mov [fs_run_ptr], eax
+    add [fs_run_lcn], r8d
+.blk_loop:
+    cmp dword [fs_run_len], 0
+    jle .run_loop
+    mov eax, [fs_run_lcn]
+    imul eax, [fs_spc]
+    add eax, [fs_part_lba]
+    mov [fs_ntfs_rec_lba], eax                    ; remember for write-back
+    mov edi, FS_INDX_BUF
+    mov edx, [fs_indx_secs]
+    call fs_read_secs
+    jc .err
+    cmp dword [FS_INDX_BUF], 0x58444E49           ; "INDX"
+    jne .blk_next
+    mov edi, FS_INDX_BUF
+    mov ecx, [fs_indx_secs]
+    call fs_apply_fixup
+    call fs_ntfs_try_block
+    test eax, eax
+    jz .blk_next
+    mov eax, [fs_ntfs_rec_lba]
+    call fs_ntfs_write_indx
+    jc .err
+    mov eax, 1
+    clc
+    ret
+.blk_next:
+    mov eax, [fs_indx_secs]
+    xor edx, edx
+    div dword [fs_spc]
+    test eax, eax
+    jnz .havecpb
+    mov eax, 1
+.havecpb:
+    add [fs_run_lcn], eax
+    sub [fs_run_len], eax
+    jmp .blk_loop
+.after:
+    mov [fs_run_ptr], eax
+    jmp .run_loop
+.none:
+    xor eax, eax
+    clc
+    ret
+.err:
+    stc
+    ret
+
+; --- NTFS $FILE_NAME collation: rsi = absolute address of an index entry.
+; Returns eax=1 if the new file (fs_target_raw, uppercased) sorts at or before
+; this entry's name (i.e. insert here), else eax=0. ASCII-uppercase compare,
+; matching how the rest of the NTFS code case-folds names. ---
+fs_ntfs_ins_here:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    movzx ecx, byte [rsi + 16 + 0x40]           ; entry name length (chars)
+    lea rbx, [rsi + 16 + 0x42]                   ; entry name (UTF-16)
+    lea rdi, [fs_target_raw]
+    mov edx, [fs_target_raw_len]
+    xor esi, esi                                 ; i
+.l:
+    cmp esi, edx
+    jae .insert                                  ; target exhausted -> <= entry
+    cmp esi, ecx
+    jae .not                                     ; entry exhausted -> target > entry
+    movzx eax, word [rbx + rsi*2]                ; entry char
+    cmp eax, 0x7F
+    jbe .eok
+    mov eax, '?'
+.eok:
+    cmp al, 'a'
+    jb .ehave
+    cmp al, 'z'
+    ja .ehave
+    sub al, 0x20
+.ehave:
+    mov ah, [rdi + rsi]                          ; target char (already upper)
+    cmp ah, al
+    jb .insert                                   ; target < entry
+    ja .not                                      ; target > entry
+    inc esi
+    jmp .l
+.insert:
+    mov eax, 1
+    jmp .out
+.not:
+    xor eax, eax
+.out:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
     ret

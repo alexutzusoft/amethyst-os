@@ -168,4 +168,18 @@ fs_echo_unsupported_msg db "echo: only FAT16/32/exFAT write is supported (found 
 fs_echo_nospace_msg db "echo: no free directory entry or cluster", 0
 fs_echo_toobig_msg db "echo: text too large for one cluster", 0
 fs_echo_name_toobig_msg db "echo: filename too long for exFAT write (max 15 chars)", 0
+fs_echo_ntfs_bigdir_msg db "echo: NTFS root dir too large for write (has INDEX_ALLOCATION)", 0
+fs_echo_ntfs_err_msg db "echo: NTFS write failed", 0
+fs_dbg_echo_msg db "[ntfs] echo len=", 0
+fs_dbg_search_msg db "[ntfs] search found=", 0
+fs_dbg_ow_msg db "[ntfs] overwrite ref=", 0
+fs_dbg_ow_data_msg db "[ntfs] data attr off=", 0
+fs_dbg_ow_wrote_msg db "[ntfs] overwrite wrote used=", 0
+fs_dbg_create_msg db "[ntfs] create path", 0
+fs_dbg_alloc_msg db "[ntfs] alloc ref=", 0
+fs_dbg_built_msg db "[ntfs] built record used=", 0
+fs_dbg_insert_msg db "[ntfs] index insert entlen=", 0
+fs_dbg_indx_msg db "[ntfs] indx-alloc insert entlen=", 0
+fs_dbg_bigdir_msg db "[ntfs] bigdir (has 0xA0)", 0
+fs_dbg_ok_msg db "[ntfs] ok", 0
 
