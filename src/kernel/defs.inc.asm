@@ -150,7 +150,9 @@ CRTC_CURSOR_DISABLE_BIT equ 0x20
 ASCII_CR equ 0x0D
 ASCII_BS equ 0x08
 
-CMD_BUFFER_SIZE equ 128
+; 256 is the largest that keeps the single-byte line-editor counters valid
+; (max length CMD_BUFFER_SIZE-1 = 255 still fits a db).
+CMD_BUFFER_SIZE equ 256
 EXEC_BUFFER_SIZE equ 256
 CMD_HISTORY_ENTRIES equ 16
 

@@ -426,6 +426,8 @@ redraw_input_line:
     jae .done
     mov rdi, [line_start_pos]
     lea rdi, [rdi + rcx * 2]
+    cmp rdi, VGA_SIZE                 ; stop at the framebuffer edge (long lines)
+    jae .done
     add rdi, VGA_MEM
 
     movzx r8, byte [cmd_len]

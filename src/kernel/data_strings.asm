@@ -179,7 +179,10 @@ fs_echo_ex_cand_off dd 0
 fs_echo_ex_i dd 0
 fs_echo_ex_lba dd 0
 fs_echo_ex_off dd 0
-fs_echo_ex_set times 96 db 0
+fs_ex_name_entries dd 0           ; number of 0xC1 name entries = ceil(len/15)
+fs_ex_set_entries dd 0            ; total entries in the set = 2 + name entries
+; entry set: 0x85 file + 0xC0 stream + up to ceil(255/15)=17 name entries = 19*32 = 608
+fs_echo_ex_set times 640 db 0
 fs_gpt_ent_lba dd 0
 fs_gpt_left dd 0
 fs_is_ntfs db 0
@@ -228,8 +231,36 @@ fs_echo_have_slot db 0
 fs_echo_found db 0
 fs_echo_ptr dq 0
 fs_echo_len dd 0
-fs_echo_cluster dd 0
+fs_echo_cluster dd 0             ; first cluster of the allocated chain
 fs_echo_clus dd 0
+fs_echo_prev_clus dd 0           ; previous cluster while chaining (0 = none yet)
+fs_echo_nclus dd 0              ; number of clusters to allocate for the payload
+fs_echo_ci dd 0                 ; cluster-walk index during data write
+fs_echo_written dd 0           ; bytes written so far during data write
+fs_echo_chunk dd 0            ; bytes copied into the current sector
+fs_fatset_clus dd 0            ; fs_*_fat_set helper: target cluster
+fs_fatset_val dd 0            ; fs_*_fat_set helper: value to store
+fs_fatset_lba dd 0           ; fs_*_fat_set helper: containing FAT sector LBA
+; FAT long-file-name (VFAT) write state
+fs_lfn_count dd 0              ; number of 0x0F LFN entries to emit
+fs_lfn_sum db 0                ; 8.3 short-name checksum
+fs_need_lfn db 0              ; 1 when the name doesn't fit a plain 8.3 entry
+fs_lfn_i dd 0                 ; LFN build/write loop index
+fs_lfn_base dd 0             ; base char index while (de)composing a name
+fs_lfn_lastdot dd 0          ; index of last '.' in the name (-1 = none)
+fs_lfn_namelen dd 0          ; 8.3-check: chars before the last dot
+fs_lfn_extlen dd 0           ; 8.3-check: chars after the last dot
+; FAT free-directory-slot run search (create needs LFN entries + 8.3 contiguous)
+fs_echo_need_run dd 1        ; number of contiguous free entries required
+fs_echo_run dd 0             ; current contiguous free-entry run length
+fs_echo_run_lba dd 0         ; LBA of the run's first free entry
+fs_echo_run_off dd 0         ; byte offset (within sector) of the run start
+; LFN read reconstruction (shared by ls and cat)
+fs_lfn_have db 0             ; 1 when an LFN name has been accumulated
+fs_lfn_maxlen dd 0           ; reconstructed name length
+fs_lfn_buf times 260 db 0    ; reconstructed ASCII name
+; dest byte offsets of the 13 UTF-16 chars within a 0x0F LFN entry
+fs_lfn_off db 1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30
 redir_pos dq 0
 fs_echo_fname dq 0
 echo_data_buf times CMD_BUFFER_SIZE + 1 db 0

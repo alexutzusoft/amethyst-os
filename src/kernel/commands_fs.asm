@@ -757,6 +757,8 @@ fs_is_vbr:
 ; fixed root region; FAT32/exFAT: follow the root cluster chain through the
 ; FAT. CF set on read error. ---
 fs_list_root:
+    mov byte [fs_lfn_have], 0
+    mov dword [fs_lfn_maxlen], 0
     cmp byte [fs_is_ntfs], 0
     jne fs_ntfs_list
     cmp byte [fs_is_exfat], 0
@@ -850,14 +852,25 @@ fs_list_sector:
     test al, al
     jz .end_marker
     cmp al, 0xE5                     ; deleted
-    je .skip
+    je .del
     mov al, [rsi + 11]
-    test al, 0x08                    ; volume label (LFN's 0x0F includes it)
+    cmp al, 0x0F                     ; long-file-name entry
+    je .lfn
+    test al, 0x08                    ; volume label
     jnz .skip
-    call fs_print_entry
+    call fs_print_entry_lfn
+    mov byte [fs_lfn_have], 0
+    mov dword [fs_lfn_maxlen], 0
 .skip:
     add dword [fs_entry_off], 32
     jmp .loop
+.lfn:
+    call fs_lfn_accumulate
+    jmp .skip
+.del:
+    mov byte [fs_lfn_have], 0        ; deleted entry breaks the LFN chain
+    mov dword [fs_lfn_maxlen], 0
+    jmp .skip
 .exfat:
     mov al, [rsi]
     test al, al
@@ -991,6 +1004,128 @@ fs_print_entry:
 .cr:
     mov al, ASCII_CR
     call print_char
+    ret
+
+; --- Accumulate one VFAT long-file-name entry (rsi -> 0x0F entry) into
+; fs_lfn_buf. Entries arrive in reverse sequence order; each holds 13
+; UTF-16 chars placed by its sequence number. Sets fs_lfn_have. Non-ASCII
+; folds to '?'. Clobbers eax/ebx/ecx/edx (not rsi). ---
+fs_lfn_accumulate:
+    movzx eax, byte [rsi]
+    and eax, 0x1F                    ; sequence number (1-based)
+    test eax, eax
+    jz .ret
+    cmp eax, 20
+    ja .ret
+    dec eax
+    imul eax, eax, 13
+    mov [fs_lfn_base], eax           ; base index = (seq-1)*13
+    mov byte [fs_lfn_have], 1
+    xor ebx, ebx                     ; char index 0..12
+.cl:
+    cmp ebx, 13
+    jae .ret
+    movzx ecx, byte [fs_lfn_off + rbx]
+    mov ax, [rsi + rcx]
+    test ax, ax
+    jz .ret                          ; 0x0000 terminator: name ends
+    cmp ax, 0xFFFF
+    je .ret                          ; padding
+    cmp ax, 0x7F
+    jbe .st
+    mov ax, '?'
+.st:
+    mov ecx, [fs_lfn_base]
+    add ecx, ebx
+    cmp ecx, 259
+    jae .nxt
+    mov [fs_lfn_buf + rcx], al
+    inc ecx
+    cmp ecx, [fs_lfn_maxlen]
+    jbe .nxt
+    mov [fs_lfn_maxlen], ecx
+.nxt:
+    inc ebx
+    jmp .cl
+.ret:
+    ret
+
+; --- Print a directory entry (rsi -> 8.3 entry) using the accumulated LFN
+; long name if present, otherwise the plain 8.3 name. Same size/<DIR>
+; trailer as fs_print_entry. ---
+fs_print_entry_lfn:
+    cmp byte [fs_lfn_have], 0
+    je fs_print_entry
+    push rsi
+    mov dword [fs_name_len], 0
+    xor ecx, ecx
+.nl:
+    cmp ecx, [fs_lfn_maxlen]
+    jae .nd
+    mov al, [fs_lfn_buf + rcx]
+    call print_char
+    inc dword [fs_name_len]
+    inc ecx
+    jmp .nl
+.nd:
+    cmp dword [fs_name_len], 14
+    jae .sp
+.pad:
+    cmp dword [fs_name_len], 14
+    jae .pd
+    mov al, ' '
+    call print_char
+    inc dword [fs_name_len]
+    jmp .pad
+.sp:
+    mov al, ' '
+    call print_char
+.pd:
+    pop rsi
+    mov al, [rsi + 11]
+    test al, 0x10
+    jz .file
+    push rsi
+    mov rsi, fs_dir_tag_msg
+    call print_string
+    pop rsi
+    jmp .cr
+.file:
+    mov eax, [rsi + 28]
+    call print_dec64
+.cr:
+    mov al, ASCII_CR
+    call print_char
+    ret
+
+; --- Compare the accumulated LFN name (uppercased) against fs_target_raw.
+; Returns al=1 (and ZF set) on match, al=0 otherwise. ---
+fs_lfn_match:
+    mov eax, [fs_lfn_maxlen]
+    cmp eax, [fs_target_raw_len]
+    jne .no
+    xor ecx, ecx
+.l:
+    cmp ecx, [fs_lfn_maxlen]
+    jae .yes
+    mov al, [fs_lfn_buf + rcx]
+    cmp al, 'a'
+    jb .cmp
+    cmp al, 'z'
+    ja .cmp
+    sub al, 0x20
+.cmp:
+    mov dl, [fs_target_raw + rcx]
+    cmp al, dl
+    jne .no
+    inc ecx
+    jmp .l
+.yes:
+    mov al, 1
+    test al, al                      ; clear ZF? set: al=1 -> ZF=0. use al as truth
+    ret
+.no:
+    xor al, al
     ret
 
 ; --- Read fs_rec_secs sectors starting at LBA eax into buffer edi. ---
@@ -1865,10 +2000,102 @@ fs_build_target_name:
     jz .no_ext_lower
     or byte [fs_target_case], 0x10
 .no_ext_lower:
+    call fs_lfn_prepare
     pop rdi
     pop rcx
     pop rbx
     pop rax
+    ret
+
+; --- Decide whether the name needs a VFAT long-file-name (it doesn't fit a
+; plain 8.3 short name). Sets fs_need_lfn and fs_lfn_count; when set, rewrites
+; fs_target_name into a "NAME~1" 8.3 alias. Works off fs_target_disp (the
+; original-case name of length fs_target_raw_len). ---
+fs_lfn_prepare:
+    mov byte [fs_need_lfn], 0
+    mov dword [fs_lfn_count], 0
+    mov eax, [fs_target_raw_len]
+    test eax, eax
+    jz .ret
+    mov dword [fs_lfn_lastdot], -1
+    xor ecx, ecx                     ; index
+    xor ebx, ebx                     ; dot count
+.scan:
+    cmp ecx, [fs_target_raw_len]
+    jae .scandone
+    mov al, [fs_target_disp + rcx]
+    cmp al, '.'
+    jne .scannext
+    mov [fs_lfn_lastdot], ecx
+    inc ebx
+.scannext:
+    inc ecx
+    jmp .scan
+.scandone:
+    mov eax, [fs_lfn_lastdot]
+    cmp eax, -1
+    jne .havedot
+    mov eax, [fs_target_raw_len]
+    mov [fs_lfn_namelen], eax
+    mov dword [fs_lfn_extlen], 0
+    jmp .decide
+.havedot:
+    mov [fs_lfn_namelen], eax
+    mov ecx, [fs_target_raw_len]
+    sub ecx, eax
+    dec ecx
+    mov [fs_lfn_extlen], ecx
+.decide:
+    cmp ebx, 1
+    ja .need                         ; more than one dot
+    cmp dword [fs_lfn_namelen], 8
+    ja .need
+    cmp dword [fs_lfn_extlen], 3
+    ja .need
+    cmp dword [fs_lfn_namelen], 0
+    je .need                         ; leading-dot name (e.g. ".cfg")
+    jmp .ret                         ; fits 8.3 - keep the plain short entry
+.need:
+    mov byte [fs_need_lfn], 1
+    mov eax, [fs_target_raw_len]
+    add eax, 12
+    xor edx, edx
+    mov ecx, 13
+    div ecx
+    mov [fs_lfn_count], eax           ; ceil(len/13)
+    call fs_make_alias
+.ret:
+    ret
+
+; --- Rewrite fs_target_name (already an uppercased, truncated 8.3 form) into
+; a "NAME~1" alias: keep up to 6 name chars, append "~1", keep the extension.
+; Clears fs_target_case (alias is uppercase). ---
+fs_make_alias:
+    xor ecx, ecx
+.nl:
+    cmp ecx, 8
+    jae .have
+    cmp byte [fs_target_name + rcx], ' '
+    je .have
+    inc ecx
+    jmp .nl
+.have:
+    cmp ecx, 6
+    jbe .cap
+    mov ecx, 6
+.cap:
+    mov byte [fs_target_name + rcx], '~'
+    inc ecx
+    mov byte [fs_target_name + rcx], '1'
+    inc ecx
+.pad:
+    cmp ecx, 8
+    jae .done
+    mov byte [fs_target_name + rcx], ' '
+    inc ecx
+    jmp .pad
+.done:
+    mov byte [fs_target_case], 0
     ret
 
 ; --- Find fs_target_name/fs_target_raw in the mounted volume's root
@@ -1876,6 +2103,8 @@ fs_build_target_name:
 ; read error. ---
 fs_cat_root:
     mov byte [fs_cat_found], 0
+    mov byte [fs_lfn_have], 0
+    mov dword [fs_lfn_maxlen], 0
     cmp byte [fs_is_ntfs], 0
     jne .ntfs
     cmp byte [fs_is_exfat], 0
@@ -1994,6 +2223,15 @@ fs_cat_root:
 ; cluster) if it does. CF set on I/O error; "no free directory entry" is
 ; reported and treated as handled. ---
 fs_echo_root:
+    ; contiguous free directory entries needed by a create: LFN entries + 8.3
+    mov dword [fs_echo_need_run], 1
+    mov dword [fs_echo_run], 0
+    cmp byte [fs_need_lfn], 0
+    je .nr_done
+    mov eax, [fs_lfn_count]
+    inc eax
+    mov [fs_echo_need_run], eax
+.nr_done:
     cmp byte [fs_is_ntfs], 0
     jne .ntfs
     cmp byte [fs_is_exfat], 0
@@ -2068,16 +2306,19 @@ fs_echo_root:
     mov [fs_cur_cluster], eax
     jmp .clus_loop
 .exfat:
+    ; name entries = ceil(len / 15); total set = 2 + name entries
     mov eax, [fs_target_raw_len]
-    cmp eax, 15
-    jbe .exfat_len_ok
-    mov rsi, fs_echo_name_toobig_msg
-    call print_string
-    mov al, ASCII_CR
-    call print_char
-    clc
-    ret
-.exfat_len_ok:
+    add eax, 14
+    xor edx, edx
+    mov ecx, 15
+    div ecx                          ; eax = ceil(len/15)
+    test eax, eax
+    jnz .exfat_have_entries
+    mov eax, 1                        ; at least one name entry (empty name edge case)
+.exfat_have_entries:
+    mov [fs_ex_name_entries], eax
+    add eax, 2
+    mov [fs_ex_set_entries], eax
     mov eax, [fs_cur_cluster]
     mov [fs_ex_root_clus], eax
     call fs_exfat_find_bitmap
@@ -2156,7 +2397,20 @@ fs_echo_root:
     jc .fail
     call fs_echo_write_data
     jc .fail
+    ; overwrite of an existing file just updates its 8.3 entry in place
+    ; (any pre-existing LFN entries stay valid); a create with a long name
+    ; lays down the full LFN + 8.3 set at the free run.
+    cmp byte [fs_echo_found], 0
+    jne .fat_short
+    cmp byte [fs_need_lfn], 0
+    jne .fat_lfn
+.fat_short:
     call fs_echo_write_entry
+    jc .fail
+    clc
+    ret
+.fat_lfn:
+    call fs_echo_write_lfn_set
     jc .fail
     clc
     ret
@@ -2270,7 +2524,8 @@ fs_echo_sector_exfat:
     mov [fs_echo_ex_run_off], eax
 .run_have_start:
     inc dword [fs_echo_ex_run]
-    cmp dword [fs_echo_ex_run], 3
+    mov eax, [fs_echo_ex_run]
+    cmp eax, [fs_ex_set_entries]
     jb .skip
     cmp byte [fs_echo_have_slot], 0
     jne .skip
@@ -2374,17 +2629,55 @@ fs_echo_sector_exfat:
 ; typical small volumes). Sets the bit, marks the FAT entry end-of-chain
 ; (this driver always walks exFAT files via the FAT chain, ignoring
 ; NoFatChain). Result in fs_echo_cluster. CF set on error/no space. ---
+; --- Set a 32-bit FAT entry (exFAT / FAT32): eax = cluster, edx = value.
+; Read-modify-write the containing FAT sector; invalidates fs_fat_cached.
+; Uses memory scratch (no register survival across USB I/O). CF on error. ---
+fs_exfat_fat_set:
+    mov [fs_fatset_clus], eax
+    mov [fs_fatset_val], edx
+    mov ecx, eax
+    shr ecx, 7                        ; 128 32-bit entries per sector
+    add ecx, [fs_fat_lba]
+    mov [fs_fatset_lba], ecx
+    mov eax, ecx
+    mov edi, FS_FAT_BUF
+    call fs_read_sector
+    jc .err
+    mov dword [fs_fat_cached], 0xFFFFFFFF
+    mov eax, [fs_fatset_clus]
+    and eax, 127
+    mov edx, [fs_fatset_val]
+    mov [FS_FAT_BUF + rax*4], edx
+    mov eax, [fs_fatset_lba]
+    mov edi, FS_FAT_BUF
+    call fs_write_sector
+    jc .err
+    clc
+    ret
+.err:
+    stc
+    ret
+
 fs_echo_alloc_exfat:
     mov dword [fs_echo_cluster], 0
+    mov dword [fs_echo_prev_clus], 0
     mov eax, [fs_echo_len]
     test eax, eax
     jz .done
+    ; nclus = ceil(len / bytes-per-cluster)
     mov ecx, [fs_spc]
     shl ecx, 9
-    cmp eax, ecx
-    ja .too_big
+    mov eax, [fs_echo_len]
+    add eax, ecx
+    dec eax
+    xor edx, edx
+    div ecx
+    mov [fs_echo_nclus], eax
     cmp dword [fs_ex_bitmap_clus], 0
     je .nospace
+.alloc_one:
+    ; rescan the bitmap from the start; bits we already set are now on disk,
+    ; so each pass finds the next still-free cluster (N is tiny).
     mov eax, [fs_ex_bitmap_clus]
     sub eax, 2
     imul eax, [fs_spc]
@@ -2436,29 +2729,34 @@ fs_echo_alloc_exfat:
     mov eax, [fs_cat_size]
     add eax, ebx
     add eax, 2
-    mov [fs_echo_cluster], eax
+    mov [fs_echo_clus], eax           ; newly allocated cluster
     bts edx, ebx
     mov [FS_SECTOR_BUF + rcx], dl
     mov eax, [fs_cur_lba]
     mov edi, FS_SECTOR_BUF
     call fs_write_sector
     jc .fail
-    mov eax, [fs_echo_cluster]
-    mov ecx, eax
-    shr ecx, 7
-    add ecx, [fs_fat_lba]
-    mov eax, ecx
-    mov edi, FS_FAT_BUF
-    call fs_read_sector
+    ; FAT[new] = EOC
+    mov eax, [fs_echo_clus]
+    mov edx, 0x0FFFFFFF
+    call fs_exfat_fat_set
     jc .fail
-    mov dword [fs_fat_cached], 0xFFFFFFFF
-    mov eax, [fs_echo_cluster]
-    and eax, 127
-    mov dword [FS_FAT_BUF + rax*4], 0x0FFFFFFF
-    mov eax, ecx
-    mov edi, FS_FAT_BUF
-    call fs_write_sector
+    ; link previous cluster to this one, or record it as the first
+    cmp dword [fs_echo_prev_clus], 0
+    jne .link_prev
+    mov eax, [fs_echo_clus]
+    mov [fs_echo_cluster], eax
+    jmp .after_link
+.link_prev:
+    mov eax, [fs_echo_prev_clus]
+    mov edx, [fs_echo_clus]
+    call fs_exfat_fat_set
     jc .fail
+.after_link:
+    mov eax, [fs_echo_clus]
+    mov [fs_echo_prev_clus], eax
+    dec dword [fs_echo_nclus]
+    jnz .alloc_one
     clc
     ret
 .done:
@@ -2466,13 +2764,6 @@ fs_echo_alloc_exfat:
     ret
 .nospace:
     mov rsi, fs_echo_nospace_msg
-    call print_string
-    mov al, ASCII_CR
-    call print_char
-    stc
-    ret
-.too_big:
-    mov rsi, fs_echo_toobig_msg
     call print_string
     mov al, ASCII_CR
     call print_char
@@ -2519,19 +2810,21 @@ fs_exfat_name_hash:
 ; boundary (one read-modify-write per entry). CF set on I/O error. ---
 fs_echo_write_entry_exfat:
     lea rdi, [fs_echo_ex_set]
-    mov ecx, 96
+    mov ecx, 640
     xor eax, eax
     rep stosb
     lea rdi, [fs_echo_ex_set]
     mov byte [rdi + 0], 0x85
-    mov byte [rdi + 1], 2
+    mov eax, [fs_ex_set_entries]      ; SecondaryCount = stream + name entries
+    dec eax
+    mov [rdi + 1], al
     mov word [rdi + 4], 0x0020        ; ATTR_ARCHIVE
     mov dword [rdi + 8], 0x00210000   ; CreateTimestamp: 1980-01-01 00:00:00
     mov dword [rdi + 12], 0x00210000  ; LastModifiedTimestamp
     mov dword [rdi + 16], 0x00210000  ; LastAccessedTimestamp
     lea rdi, [fs_echo_ex_set + 32]
     mov byte [rdi + 0], 0xC0
-    mov byte [rdi + 1], 0x03          ; AllocationPossible, NoFatChain (single contiguous cluster)
+    mov byte [rdi + 1], 0x01          ; AllocationPossible (FAT chain; NoFatChain clear)
     mov eax, [fs_target_raw_len]
     mov [rdi + 3], al
     call fs_exfat_name_hash
@@ -2542,25 +2835,37 @@ fs_echo_write_entry_exfat:
     mov [rdi + 20], eax
     mov eax, [fs_echo_len]
     mov [rdi + 24], eax                ; DataLength (low dword)
-    lea rdi, [fs_echo_ex_set + 64]
-    mov byte [rdi + 0], 0xC1
-    mov ecx, [fs_target_raw_len]
-    lea rsi, [fs_target_disp]
-    xor ebx, ebx
-.name_copy:
-    cmp ebx, ecx
+    ; --- name entries: 15 UTF-16 chars each, source fs_target_disp ---
+    xor ebx, ebx                       ; ebx = char index into the name
+.name_ent_loop:
+    mov eax, ebx
+    cmp eax, [fs_target_raw_len]
     jae .name_copy_done
+    ; entry base = fs_echo_ex_set + 64 + (ebx/15)*32
+    mov eax, ebx
+    xor edx, edx
+    mov ecx, 15
+    div ecx                            ; eax = entry index, edx = char-in-entry
+    shl eax, 5                         ; *32
+    lea rdi, [fs_echo_ex_set + 64]
+    add rdi, rax
+    mov byte [rdi + 0], 0xC1
+    lea rsi, [fs_target_disp]
     mov al, [rsi + rbx]
-    mov [rdi + 2 + rbx*2], al
-    mov byte [rdi + 2 + rbx*2 + 1], 0
+    mov [rdi + 2 + rdx*2], al           ; UTF-16LE low byte
+    mov byte [rdi + 2 + rdx*2 + 1], 0   ; high byte = 0
     inc ebx
-    jmp .name_copy
+    jmp .name_ent_loop
 .name_copy_done:
+    ; checksum spans every entry byte (set_entries*32), skipping bytes 2,3 of entry 0
+    mov eax, [fs_ex_set_entries]
+    shl eax, 5
+    mov [fs_echo_ex_off], eax           ; reuse ex_off as byte-span scratch
     xor edx, edx
     xor ecx, ecx
     lea rsi, [fs_echo_ex_set]
 .chk_loop:
-    cmp ecx, 96
+    cmp ecx, [fs_echo_ex_off]
     jae .chk_done
     cmp ecx, 2
     je .chk_skip
@@ -2583,7 +2888,7 @@ fs_echo_write_entry_exfat:
     mov dword [fs_echo_ex_i], 0
 .write_loop:
     mov eax, [fs_echo_ex_i]
-    cmp eax, 3
+    cmp eax, [fs_ex_set_entries]
     jae .write_done
     mov eax, [fs_echo_off]
     shr eax, 5
@@ -2621,10 +2926,11 @@ fs_echo_write_entry_exfat:
     ret
 
 ; --- Scan the 16 directory entries in FS_SECTOR_BUF for fs_target_name
-; (overwrite target) and, in the same pass, the first free (0x00 or 0xE5)
-; entry (create target, recorded in fs_echo_lba/off if fs_echo_have_slot
-; was still 0). CF set to stop the caller's scan: an exact name match was
-; found (fs_echo_found=1) or the 0x00 end-of-directory marker was hit. ---
+; (overwrite target) and, in the same pass, a run of fs_echo_need_run
+; contiguous free (0xE5) entries (create target, recorded in fs_echo_lba/off
+; once fs_echo_have_slot is set). The free run persists across sectors via
+; fs_echo_run (reset by the caller before the scan). CF set to stop the
+; scan: an exact name match (fs_echo_found=1) or the 0x00 end marker. ---
 fs_echo_sector:
     mov dword [fs_entry_off], 0
 .loop:
@@ -2638,6 +2944,7 @@ fs_echo_sector:
     jz .end_marker
     cmp al, 0xE5
     je .free_slot
+    mov dword [fs_echo_run], 0        ; in-use entry breaks the free run
     mov al, [rsi + 11]
     test al, 0x08                    ; volume label / LFN entry
     jnz .skip
@@ -2662,11 +2969,22 @@ fs_echo_sector:
     stc
     ret
 .free_slot:
+    cmp dword [fs_echo_run], 0
+    jne .fr_have
+    mov eax, [fs_cur_lba]             ; remember where this run started
+    mov [fs_echo_run_lba], eax
+    mov eax, [fs_entry_off]
+    mov [fs_echo_run_off], eax
+.fr_have:
+    inc dword [fs_echo_run]
     cmp byte [fs_echo_have_slot], 0
     jne .skip
-    mov eax, [fs_cur_lba]
+    mov eax, [fs_echo_run]
+    cmp eax, [fs_echo_need_run]
+    jb .skip
+    mov eax, [fs_echo_run_lba]
     mov [fs_echo_lba], eax
-    mov eax, [fs_entry_off]
+    mov eax, [fs_echo_run_off]
     mov [fs_echo_off], eax
     mov byte [fs_echo_have_slot], 1
 .skip:
@@ -2676,33 +2994,92 @@ fs_echo_sector:
     clc
     ret
 .end_marker:
+    ; end of directory: entries from here on are free. Start the run here if
+    ; none is in progress; the caller writes need_run contiguous entries.
     cmp byte [fs_echo_have_slot], 0
     jne .stop
+    cmp dword [fs_echo_run], 0
+    jne .use_run
     mov eax, [fs_cur_lba]
     mov [fs_echo_lba], eax
     mov eax, [fs_entry_off]
+    mov [fs_echo_off], eax
+    mov byte [fs_echo_have_slot], 1
+    jmp .stop
+.use_run:
+    mov eax, [fs_echo_run_lba]
+    mov [fs_echo_lba], eax
+    mov eax, [fs_echo_run_off]
     mov [fs_echo_off], eax
     mov byte [fs_echo_have_slot], 1
 .stop:
     stc
     ret
 
-; --- Allocate one free FAT32/16 cluster for fs_echo_len bytes (0 bytes ->
-; cluster 0, no allocation). echo's input is bounded well under one
-; cluster (CMD_BUFFER_SIZE = 128 bytes vs. a minimum 512-byte cluster),
-; so a single cluster always suffices - no chain-linking needed. Scans
-; the FAT for the first free (0) entry starting at cluster 2, marks it
-; end-of-chain, and flushes that FAT sector. Result in fs_echo_cluster.
-; CF set on read/write error, "file too large" or "volume full". ---
+; --- Set a FAT entry (dual-width: FAT16 2-byte, FAT32 4-byte): eax = cluster,
+; edx = value (FAT16 stores the low word). Read-modify-write the containing
+; FAT sector; invalidates fs_fat_cached. Memory scratch, no register survival
+; across USB I/O. CF on error. ---
+fs_fat_set:
+    mov [fs_fatset_clus], eax
+    mov [fs_fatset_val], edx
+    mov ecx, eax
+    cmp byte [fs_is_fat16], 0
+    jne .f16
+    shr ecx, 7
+    jmp .have
+.f16:
+    shr ecx, 8
+.have:
+    add ecx, [fs_fat_lba]
+    mov [fs_fatset_lba], ecx
+    mov eax, ecx
+    mov edi, FS_FAT_BUF
+    call fs_read_sector
+    jc .err
+    mov dword [fs_fat_cached], 0xFFFFFFFF
+    mov eax, [fs_fatset_clus]
+    mov edx, [fs_fatset_val]
+    cmp byte [fs_is_fat16], 0
+    jne .w16
+    and eax, 127
+    mov [FS_FAT_BUF + rax*4], edx
+    jmp .flush
+.w16:
+    and eax, 255
+    mov [FS_FAT_BUF + rax*2], dx
+.flush:
+    mov eax, [fs_fatset_lba]
+    mov edi, FS_FAT_BUF
+    call fs_write_sector
+    jc .err
+    clc
+    ret
+.err:
+    stc
+    ret
+
+; --- Allocate a FAT32/16 cluster chain for fs_echo_len bytes (0 bytes ->
+; cluster 0, no allocation). nclus = ceil(len / bytes-per-cluster). Each pass
+; rescans the FAT from cluster 2 for the first free (0) entry (already-marked
+; clusters are non-zero, so successive passes find the next free one), marks
+; it end-of-chain, and links the previous cluster to it. First cluster lands
+; in fs_echo_cluster. CF set on read/write error or "volume full". ---
 fs_echo_alloc:
     mov dword [fs_echo_cluster], 0
+    mov dword [fs_echo_prev_clus], 0
     mov eax, [fs_echo_len]
     test eax, eax
     jz .done
     mov ecx, [fs_spc]
     shl ecx, 9                        ; bytes/cluster
-    cmp eax, ecx
-    ja .too_big
+    mov eax, [fs_echo_len]
+    add eax, ecx
+    dec eax
+    xor edx, edx
+    div ecx
+    mov [fs_echo_nclus], eax          ; number of clusters to allocate
+.alloc_one:
     mov dword [fs_cat_size], 2        ; candidate cluster
     mov dword [fs_cat_remain], 2000000 ; scan cap: bounded, no runaway
 .scan:
@@ -2735,21 +3112,34 @@ fs_echo_alloc:
     and eax, 127
     cmp dword [FS_FAT_BUF + rax*4], 0
     jne .next
-    mov dword [FS_FAT_BUF + rax*4], 0x0FFFFFFF   ; mark end-of-chain
     jmp .mark
 .cached16:
     mov eax, [fs_cat_size]
     and eax, 255
     cmp word [FS_FAT_BUF + rax*2], 0
     jne .next
-    mov word [FS_FAT_BUF + rax*2], 0xFFFF        ; mark end-of-chain
 .mark:
+    ; found a free cluster in fs_cat_size: mark EOC, then link the chain
     mov eax, [fs_cat_size]
-    mov [fs_echo_cluster], eax
-    mov eax, [fs_fat_cached]
-    mov edi, FS_FAT_BUF
-    call fs_write_sector
+    mov [fs_echo_clus], eax
+    mov edx, 0x0FFFFFFF               ; fs_fat_set stores low word for FAT16
+    call fs_fat_set
     jc .fail
+    cmp dword [fs_echo_prev_clus], 0
+    jne .link
+    mov eax, [fs_echo_clus]
+    mov [fs_echo_cluster], eax        ; first cluster of the file
+    jmp .after
+.link:
+    mov eax, [fs_echo_prev_clus]
+    mov edx, [fs_echo_clus]
+    call fs_fat_set
+    jc .fail
+.after:
+    mov eax, [fs_echo_clus]
+    mov [fs_echo_prev_clus], eax
+    dec dword [fs_echo_nclus]
+    jnz .alloc_one
     clc
     ret
 .next:
@@ -2765,35 +3155,113 @@ fs_echo_alloc:
     call print_char
     stc
     ret
-.too_big:
-    mov rsi, fs_echo_toobig_msg
-    call print_string
-    mov al, ASCII_CR
-    call print_char
-    stc
-    ret
 .fail:
     stc
     ret
 
-; --- Write fs_echo_ptr/fs_echo_len bytes (0 bytes -> nothing to do) into
-; the single cluster fs_echo_cluster, zero-padding the rest of the
-; sector. CF set on write error. ---
+; --- Advance fs_echo_clus to the next cluster in the FAT chain (dual-width:
+; FAT16 = 2-byte / 256 per sector, FAT32/exFAT = 4-byte / 128 per sector).
+; CF set on I/O error or end-of-chain. Uses FS_FAT_BUF / fs_fat_cached. ---
+fs_echo_next_cluster:
+    cmp byte [fs_is_fat16], 0
+    jne .f16
+    mov eax, [fs_echo_clus]
+    mov ecx, eax
+    shr ecx, 7
+    add ecx, [fs_fat_lba]
+    cmp ecx, [fs_fat_cached]
+    je .c32
+    mov [fs_fat_cached], ecx
+    mov eax, ecx
+    mov edi, FS_FAT_BUF
+    call fs_read_sector
+    jnc .c32
+    mov dword [fs_fat_cached], 0xFFFFFFFF
+    stc
+    ret
+.c32:
+    mov eax, [fs_echo_clus]
+    and eax, 127
+    mov eax, [FS_FAT_BUF + rax*4]
+    and eax, 0x0FFFFFFF
+    mov [fs_echo_clus], eax
+    cmp eax, 2
+    jb .end
+    cmp eax, 0x0FFFFFF8
+    jae .end
+    clc
+    ret
+.f16:
+    mov eax, [fs_echo_clus]
+    mov ecx, eax
+    shr ecx, 8
+    add ecx, [fs_fat_lba]
+    cmp ecx, [fs_fat_cached]
+    je .c16
+    mov [fs_fat_cached], ecx
+    mov eax, ecx
+    mov edi, FS_FAT_BUF
+    call fs_read_sector
+    jnc .c16
+    mov dword [fs_fat_cached], 0xFFFFFFFF
+    stc
+    ret
+.c16:
+    mov eax, [fs_echo_clus]
+    and eax, 255
+    movzx eax, word [FS_FAT_BUF + rax*2]
+    mov [fs_echo_clus], eax
+    cmp eax, 2
+    jb .end
+    cmp eax, 0xFFF8
+    jae .end
+    clc
+    ret
+.end:
+    stc
+    ret
+
+; --- Write fs_echo_ptr/fs_echo_len bytes across the cluster chain starting
+; at fs_echo_cluster (0 bytes -> nothing to do), zero-padding the final
+; partial sector. Walks spc sectors per cluster and follows the FAT chain
+; via fs_echo_next_cluster. CF set on write error. ---
 fs_echo_write_data:
     mov eax, [fs_echo_len]
     test eax, eax
     jz .done
+    mov dword [fs_echo_written], 0
     mov eax, [fs_echo_cluster]
+    mov [fs_echo_clus], eax
+.clus_loop:
+    mov eax, [fs_echo_clus]
     sub eax, 2
     imul eax, [fs_spc]
     add eax, [fs_data_lba]
     mov [fs_cur_lba], eax
+    mov dword [fs_sec_count], 0        ; sector index within this cluster
+.sec_loop:
+    mov eax, [fs_echo_written]
+    cmp eax, [fs_echo_len]
+    jae .done                         ; all bytes flushed
+    mov eax, [fs_sec_count]
+    cmp eax, [fs_spc]
+    jae .next_clus                    ; cluster exhausted, follow chain
+    ; chunk = min(remaining, 512)
+    mov eax, [fs_echo_len]
+    sub eax, [fs_echo_written]
+    cmp eax, 512
+    jbe .have_chunk
+    mov eax, 512
+.have_chunk:
+    mov [fs_echo_chunk], eax
     mov rsi, [fs_echo_ptr]
+    mov eax, [fs_echo_written]
+    add rsi, rax
     lea rdi, [FS_SECTOR_BUF]
-    mov ecx, [fs_echo_len]
+    mov ecx, [fs_echo_chunk]
     rep movsb
     mov ecx, 512
-    sub ecx, [fs_echo_len]
+    sub ecx, [fs_echo_chunk]
     jz .no_pad
     xor al, al
     rep stosb
@@ -2802,6 +3270,15 @@ fs_echo_write_data:
     mov edi, FS_SECTOR_BUF
     call fs_write_sector
     jc .fail
+    mov eax, [fs_echo_chunk]
+    add [fs_echo_written], eax
+    inc dword [fs_cur_lba]
+    inc dword [fs_sec_count]
+    jmp .sec_loop
+.next_clus:
+    call fs_echo_next_cluster
+    jc .fail
+    jmp .clus_loop
 .done:
     clc
     ret
@@ -2846,6 +3323,156 @@ fs_echo_write_entry:
     stc
     ret
 
+; --- 8.3 short-name checksum (VFAT) over fs_target_name (11 bytes). Result
+; in fs_lfn_sum. ---
+fs_lfn_checksum:
+    xor eax, eax
+    xor ecx, ecx
+.l:
+    cmp ecx, 11
+    jae .d
+    movzx edx, byte [fs_target_name + rcx]
+    mov ebx, eax
+    and ebx, 1
+    shl ebx, 7
+    shr eax, 1
+    or eax, ebx
+    add eax, edx
+    and eax, 0xFF
+    inc ecx
+    jmp .l
+.d:
+    mov [fs_lfn_sum], al
+    ret
+
+; --- Write a full VFAT long-name set: fs_lfn_count 0x0F entries (in reverse
+; sequence order) followed by the 8.3 alias entry, starting at the free run
+; fs_echo_lba/off. The set is staged in FS_MFT_BUF (unused on FAT volumes),
+; then written entry-by-entry with a read-modify-write that follows sector
+; boundaries. CF set on I/O error. ---
+fs_echo_write_lfn_set:
+    call fs_lfn_checksum
+    ; zero (count+1)*32 bytes of the staging buffer
+    mov eax, [fs_lfn_count]
+    inc eax
+    shl eax, 5
+    mov ecx, eax
+    lea rdi, [FS_MFT_BUF]
+    xor eax, eax
+    rep stosb
+    mov dword [fs_lfn_i], 0           ; buffer entry index j (0..count-1)
+.build_loop:
+    mov eax, [fs_lfn_i]
+    cmp eax, [fs_lfn_count]
+    jae .build_short
+    mov ebx, [fs_lfn_count]
+    sub ebx, eax                      ; ebx = sequence number (count..1)
+    mov edx, eax
+    shl edx, 5
+    lea rdi, [FS_MFT_BUF]
+    add rdi, rdx                      ; rdi = staging entry
+    mov al, bl
+    cmp ebx, [fs_lfn_count]
+    jne .noflag
+    or al, 0x40                       ; last logical entry marker
+.noflag:
+    mov [rdi + 0], al
+    mov byte [rdi + 11], 0x0F
+    mov byte [rdi + 12], 0
+    mov al, [fs_lfn_sum]
+    mov [rdi + 13], al
+    mov ecx, ebx
+    dec ecx
+    imul ecx, ecx, 13
+    mov [fs_lfn_base], ecx            ; source base index = (seq-1)*13
+    xor ebx, ebx                      ; char index 0..12
+.char_loop:
+    cmp ebx, 13
+    jae .char_done
+    movzx ecx, byte [fs_lfn_off + rbx]
+    mov eax, [fs_lfn_base]
+    add eax, ebx                      ; source char index
+    cmp eax, [fs_target_raw_len]
+    jb .real
+    je .term
+    mov word [rdi + rcx], 0xFFFF       ; past end -> padding
+    jmp .char_next
+.term:
+    mov word [rdi + rcx], 0x0000       ; terminator
+    jmp .char_next
+.real:
+    movzx edx, byte [fs_target_disp + rax]
+    mov [rdi + rcx], dx                 ; UTF-16LE (high byte 0 via movzx)
+.char_next:
+    inc ebx
+    jmp .char_loop
+.char_done:
+    inc dword [fs_lfn_i]
+    jmp .build_loop
+.build_short:
+    ; 8.3 alias entry at staging index = count
+    mov eax, [fs_lfn_count]
+    shl eax, 5
+    lea rdi, [FS_MFT_BUF]
+    add rdi, rax
+    lea rsi, [fs_target_name]
+    mov ecx, 11
+    rep movsb
+    mov byte [rdi], 0x20               ; ATTR_ARCHIVE (rdi now at +11)
+    mov eax, [fs_lfn_count]
+    shl eax, 5
+    lea rdi, [FS_MFT_BUF]
+    add rdi, rax                       ; rdi = 8.3 entry base
+    mov eax, [fs_echo_cluster]
+    mov ecx, eax
+    shr ecx, 16
+    mov [rdi + 20], cx                 ; first cluster high
+    mov [rdi + 26], ax                 ; first cluster low
+    mov eax, [fs_echo_len]
+    mov [rdi + 28], eax                ; size
+    ; --- write (count+1) entries to disk from fs_echo_lba/off ---
+    mov dword [fs_echo_ex_i], 0
+.write_loop:
+    mov eax, [fs_lfn_count]
+    inc eax
+    mov ecx, [fs_echo_ex_i]
+    cmp ecx, eax
+    jae .write_done
+    mov eax, [fs_echo_off]
+    shr eax, 5                         ; entry index within its sector
+    add eax, [fs_echo_ex_i]
+    mov ecx, eax
+    and ecx, 15
+    shl ecx, 5
+    mov [fs_echo_ex_off], ecx
+    shr eax, 4
+    add eax, [fs_echo_lba]
+    mov [fs_echo_ex_lba], eax
+    mov edi, FS_SECTOR_BUF
+    call fs_read_sector
+    jc .fail
+    mov eax, [fs_echo_ex_i]
+    shl eax, 5
+    lea rsi, [FS_MFT_BUF]
+    add rsi, rax
+    mov eax, [fs_echo_ex_off]
+    lea rdi, [FS_SECTOR_BUF]
+    add rdi, rax
+    mov ecx, 32
+    rep movsb
+    mov eax, [fs_echo_ex_lba]
+    mov edi, FS_SECTOR_BUF
+    call fs_write_sector
+    jc .fail
+    inc dword [fs_echo_ex_i]
+    jmp .write_loop
+.write_done:
+    clc
+    ret
+.fail:
+    stc
+    ret
+
 ; --- Scan the 16 directory entries in FS_SECTOR_BUF for fs_target_name.
 ; CF set to stop the caller's scan, either because a matching file entry
 ; was found (fs_cat_found=1, fs_cat_cluster/fs_cat_size filled) or the
@@ -2862,10 +3489,20 @@ fs_cat_sector:
     test al, al
     jz .end_marker
     cmp al, 0xE5                     ; deleted
-    je .skip
+    je .del
     mov al, [rsi + 11]
-    test al, 0x08                    ; volume label / LFN entry
-    jnz .skip
+    cmp al, 0x0F                     ; long-file-name entry
+    je .lfn
+    test al, 0x08                    ; volume label
+    jnz .skip_reset
+    ; long-name match takes priority when an LFN set was accumulated
+    cmp byte [fs_lfn_have], 0
+    je .try_short
+    call fs_lfn_match
+    test al, al
+    jnz .matched
+    jmp .skip_reset
+.try_short:
     push rcx
     push rdi
     push rsi
@@ -2875,7 +3512,10 @@ fs_cat_sector:
     pop rsi
     pop rdi
     pop rcx
-    jne .skip
+    jne .skip_reset
+.matched:
+    mov byte [fs_lfn_have], 0
+    mov dword [fs_lfn_maxlen], 0
     mov al, [rsi + 11]
     test al, 0x10                    ; directory: cat doesn't support this
     jnz .skip
@@ -2890,6 +3530,16 @@ fs_cat_sector:
     mov byte [fs_cat_found], 1
     stc
     ret
+.lfn:
+    call fs_lfn_accumulate
+    jmp .skip
+.del:
+    mov byte [fs_lfn_have], 0        ; deleted entry breaks the LFN chain
+    mov dword [fs_lfn_maxlen], 0
+    jmp .skip
+.skip_reset:
+    mov byte [fs_lfn_have], 0
+    mov dword [fs_lfn_maxlen], 0
 .skip:
     add dword [fs_entry_off], 32
     jmp .loop
@@ -3059,6 +3709,8 @@ fs_cat_data:
     dec dword [fs_sec_count]
     jmp .sec_loop
 .next_clus:
+    cmp byte [fs_is_fat16], 0
+    jne .nc16
     mov eax, [fs_cat_cluster]
     shr eax, 7
     add eax, [fs_fat_lba]
@@ -3078,6 +3730,28 @@ fs_cat_data:
     jne .no_mask
     and eax, 0x0FFFFFFF
 .no_mask:
+    mov [fs_cat_cluster], eax
+    jmp .clus_loop
+.nc16:
+    mov eax, [fs_cat_cluster]
+    shr eax, 8                        ; 256 16-bit entries per sector
+    add eax, [fs_fat_lba]
+    cmp eax, [fs_fat_cached]
+    je .cached16
+    mov [fs_fat_cached], eax
+    mov edi, FS_FAT_BUF
+    call fs_read_sector
+    jnc .cached16
+    mov dword [fs_fat_cached], 0xFFFFFFFF
+    jmp .done
+.cached16:
+    mov eax, [fs_cat_cluster]
+    and eax, 255
+    movzx eax, word [FS_FAT_BUF + rax*2]
+    cmp eax, 0xFFF8
+    jb .store16
+    mov eax, 0x0FFFFFFF               ; normalize FAT16 EOC for .clus_loop stop
+.store16:
     mov [fs_cat_cluster], eax
     jmp .clus_loop
 .done:

@@ -53,7 +53,7 @@ command_descriptions:
     dq desc_cat,      desc_cat_end - desc_cat
     dq desc_net,      desc_net_end - desc_net
 
-desc_echo db "print text, or write it to a file: echo <text> [> <filename>] (FAT)"
+desc_echo db "print text, or write it to a file: echo <text> [> <filename>] (FAT/exFAT/NTFS, long names)"
 desc_echo_end:
 desc_run db "assemble and execute raw hex machine code: run <hex bytes>"
 desc_run_end:
@@ -95,11 +95,11 @@ desc_calc db "basic arithmetic: calc <a> <+|-|*|/|%|sqrt> [b]"
 desc_calc_end:
 desc_usb db "scan PCI for USB host controllers (UHCI/OHCI/EHCI/xHCI)"
 desc_usb_end:
-desc_ls db "list files on the first USB drive found (FAT, read-only)"
+desc_ls db "list files on the first USB drive found (FAT/exFAT/NTFS)"
 desc_ls_end:
 desc_dir db "same as ls"
 desc_dir_end:
-desc_cat db "print a file's contents: cat <filename> (FAT, read-only)"
+desc_cat db "print a file's contents: cat <filename> (FAT/exFAT/NTFS)"
 desc_cat_end:
 desc_net db "show cached network link and DHCP status"
 desc_net_end:
