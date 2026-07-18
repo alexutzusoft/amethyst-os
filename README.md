@@ -1,27 +1,26 @@
 # AmethystOS
 
-A tiny x86-64 operating system written in pure assembly (NASM), booting
-from real mode through protected mode into 64-bit long mode with no
-bootloader dependencies beyond the code in this repo.
+**A standalone x86-64 operating system written in pure NASM assembly with zero external bootloader dependencies.**
 
-Boots via legacy BIOS (MBR/El Torito) or UEFI, into a simple text-mode
-shell with commands like `help`, `echo`, `clear`, `run`, `calc`, `mem`,
-`peek`/`poke`, `cpuid`, `acpi`, `sysinfo`, `uptime`, `date`/`time`, `color`,
-`cursor`, `draw`, and `reboot`/`halt`/`shutdown`.
+---
 
-## Build & run (QEMU)
+## Overview
 
-```
-tools/build.sh
-tools/run.sh
-```
+AmethystOS is a standalone x86-64 operating system written from scratch in pure NASM assembly. Built for systems programmers and OS enthusiasts, it demonstrates custom bare-metal initialization, dual BIOS/UEFI booting into 64-bit long mode, custom xHCI USB drivers, and native filesystem parsing without external libraries or third-party bootloaders.
 
-`build.sh` produces `build/amethyst-os.iso` (hybrid BIOS+UEFI, for
-`-cdrom`/optical boot) and `build/amethyst-os.img` (raw disk image for
-`dd`/Rufus-style USB writing).
+## Features
 
-Other run scripts:
+- **Dual BIOS & UEFI Booting** — Boots seamlessly from legacy MBR/El Torito or modern UEFI firmware directly into 64-bit long mode without external bootloaders.
+- **Native xHCI & USB Storage Drivers** — Features custom USB3 controller management and bulk-only mass storage transport for bare-metal disk access.
+- **Multi-Filesystem Engine** — Parses and manipulates FAT16, FAT32, exFAT, and NTFS directory structures, including VFAT long filenames and MFT records.
+- **Interactive System Shell** — Provides a text-mode command suite for system diagnostics, hardware inspection, memory editing, power management, and file operations.
 
-- `tools/run.sh` - boot the ISO under BIOS (default QEMU path)
-- `tools/run-raw.sh` - boot the raw `.img` as a disk, exercising the MBR path directly
-- `tools/run-uefi.sh` - boot the ISO under OVMF (real UEFI firmware)
+## Maintainers
+
+| Name | Role | GitHub |
+|---|---|---|
+| Alexutzu | Lead Engineer | [@alexutzusoft](https://github.com/alexutzusoft) |
+
+## License
+
+TreeSoft Open Source © Alexutzu
