@@ -45,6 +45,10 @@ dir_cmd db "dir"
 dir_cmd_end:
 cat_cmd db "cat"
 cat_cmd_end:
+cd_cmd db "cd"
+cd_cmd_end:
+rm_cmd db "rm"
+rm_cmd_end:
 net_cmd db "net"
 net_cmd_end:
 
@@ -185,6 +189,74 @@ fs_ex_set_entries dd 0            ; total entries in the set = 2 + name entries
 fs_echo_ex_set times 640 db 0
 fs_gpt_ent_lba dd 0
 fs_gpt_left dd 0
+fs_ex_rootdir_clus dd 0          ; exFAT root directory first cluster (from mount)
+; --- cd (current working directory) state: a stack of directory first
+; clusters, persisted across commands. Every command re-scans/re-mounts the
+; USB device, so the stack is validated against the mounted volume via
+; fs_cwd_vol (partition LBA) and dropped if a different volume shows up. ---
+fs_cwd_depth dd 0                ; 0 = root
+fs_cwd_vol dd 0                  ; fs_part_lba the stack belongs to
+fs_cwd_stack times 16 dd 0       ; first cluster per level
+fs_cwd_path_len dd 0             ; display path ("/a/b"), best-effort
+fs_cwd_path times 256 db 0
+fs_in_subdir db 0                ; set by fs_apply_cwd after each mount
+fs_want_dir db 0                 ; cat-scanner mode: 1 = match directories (cd)
+fs_nc_cur dd 0                   ; fs_next_cluster scratch
+; --- rm state ---
+fs_rm_recursive db 0
+fs_rm_found db 0
+fs_rm_is_dir db 0
+fs_rm_err db 0                   ; 1 = rm -r queue full, 2 = I/O error mid-free
+fs_rm_nofat db 0                 ; exFAT NoFatChain flag of the chain being freed
+fs_rm_cluster dd 0               ; target's first cluster
+fs_rm_size dd 0                  ; target's size (exFAT contiguous-run length)
+fs_rm_set_lba dd 0               ; directory-entry set to mark deleted: sector,
+fs_rm_set_off dd 0               ;   byte offset of the first entry,
+fs_rm_set_cnt dd 0               ;   and entry count (LFN/secondary + primary)
+fs_rm_lfn_cnt dd 0               ; LFN entries accumulated for the current set
+fs_rm_i dd 0
+fs_rm_lba2 dd 0
+fs_rm_off2 dd 0
+fs_rm_cur dd 0                   ; chain-free walk: current cluster
+fs_rm_next dd 0                  ;   and next cluster / contiguous count
+fs_rm_bit dd 0                   ; exFAT bitmap-clear: bit index within sector
+fs_rm_bit_lba dd 0               ;   and containing bitmap sector LBA
+fs_rm_q_head dd 0                ; FS_RM_QUEUE ring indices (linear, no wrap)
+fs_rm_q_tail dd 0
+fs_rmw_clus dd 0                 ; rm -r directory walk: dir first cluster,
+fs_rmw_size dd 0                 ;   dir size (exFAT), current cluster, LBA,
+fs_rmw_cur dd 0                  ;   sectors left in cluster, contiguous
+fs_rmw_lba dd 0                  ;   clusters left (exFAT NoFatChain), and
+fs_rmw_secs dd 0                 ;   the dir's own NoFatChain flag
+fs_rmw_nfleft dd 0
+fs_rmw_nofat db 0
+; --- NTFS cd/rm state ---
+fs_cwd_fstype db 0               ; fs type the cwd stack belongs to (1=FAT 2=exFAT 3=NTFS)
+fs_ntfs_dir_ref dd 5             ; MFT record of the directory being walked (5 = root)
+fs_ntfs_dir_seq dd 5             ; its sequence number (for new $FILE_NAME parent refs)
+fs_ntfs_collect db 0             ; fs_ntfs_walk mode: 1 = push every entry to the rm queue
+fs_ntfs_rm_target dd 0           ; MFT record of the rm target
+fs_ntfs_rm_ref dd 0              ; MFT record currently being freed
+fs_ntfs_cur_dir dd 0             ; rm -r: directory currently being enumerated
+fs_ntfs_ent_removed db 0         ; index entries removed from the parent
+fs_ntfs_run_cnt dd 0             ; pairs collected in FS_NTFS_RUNS
+fs_ntfs_tmp_attr dd 0            ; saved attribute offset across a div/helper call
+fs_ntfs_bmp_attr dd 0            ; $Bitmap $DATA attribute offset in FS_MFT_BUF
+fs_ntfs_bmp_secidx dd 0          ; cached $Bitmap sector index (0xFFFFFFFF = none)
+fs_ntfs_bmp_lba dd 0             ; its LBA
+fs_ntfs_bmp_rem dd 0             ; sector-within-cluster while mapping bitmap VCNs
+fs_ntfs_bmp_dirty db 0
+fs_nvl_offsz dd 0                ; fs_ntfs_vcn_to_lcn run-decode scratch
+fs_nvl_len dd 0
+fs_ncr_ptr dd 0                  ; fs_ntfs_collect_runs cursor / running LCN
+fs_ncr_lcn dd 0
+fs_ntfs_ri dd 0                  ; fs_ntfs_free_runs loop state
+fs_ntfs_rl_c dd 0
+fs_ntfs_rl_len dd 0
+fs_nre_attr dd 0                 ; fs_ntfs_remove_entry: attribute offset,
+fs_nre_root dd 0                 ;   INDEX_ROOT value offset,
+fs_nre_len dd 0                  ;   removed entry length,
+fs_nre_mod db 0                  ;   record-modified flag
 fs_is_ntfs db 0
 fs_mft_lba dd 0
 fs_rec_secs dd 0

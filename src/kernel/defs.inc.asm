@@ -89,6 +89,10 @@ FS_SECTOR_BUF    equ FS_SCRATCH_BASE + 0x3000   ; 512-byte sector reads (MBR/VBR
 FS_FAT_BUF       equ FS_SCRATCH_BASE + 0x3400   ; 512-byte cached FAT sector (FAT32 chains)
 FS_MFT_BUF       equ FS_SCRATCH_BASE + 0x4000   ; NTFS MFT file record (up to 8 sectors)
 FS_INDX_BUF      equ FS_SCRATCH_BASE + 0x6000   ; NTFS INDX index block (up to 16 sectors)
+FS_RM_QUEUE      equ FS_SCRATCH_BASE + 0x8000   ; rm -r pending-directory queue (12B records)
+FS_RM_QUEUE_MAX  equ 256                        ; max directories per rm -r (3KB used)
+FS_NTFS_RUNS     equ FS_SCRATCH_BASE + 0x9000   ; rm: collected {LCN,len} pairs of a record's non-resident runs
+FS_NTFS_RUNS_MAX equ 512                        ; 512 pairs * 8B = 4KB
 
 ; --- BIOS memory map captured by stage1.asm's detect_memory (real mode,
 ; before the switch to protected/long mode - BIOS interrupts aren't
@@ -201,7 +205,7 @@ NET_TX_DESC_COUNT equ 16
 NET_BUF_SIZE      equ 2048
 
 ; --- Network scratch region. 5MB mark: clear of FS_SCRATCH's highest use
-; (FS_INDX_BUF, FS_SCRATCH_BASE + 0x6000 + up to 16 sectors = ~0x408000). ---
+; (FS_NTFS_RUNS, FS_SCRATCH_BASE + 0x9000 + 512*8 = 0x40A000). ---
 NET_SCRATCH_BASE  equ 0x500000
 NET_RX_RING       equ NET_SCRATCH_BASE + 0x0000  ; 16 * 16B descriptors
 NET_TX_RING       equ NET_SCRATCH_BASE + 0x1000  ; 16 * 16B descriptors

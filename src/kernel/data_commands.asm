@@ -23,6 +23,8 @@ command_table:
     dq ls_cmd, ls_cmd_end - ls_cmd, cmd_ls
     dq dir_cmd, dir_cmd_end - dir_cmd, cmd_ls
     dq cat_cmd, cat_cmd_end - cat_cmd, cmd_cat
+    dq cd_cmd, cd_cmd_end - cd_cmd, cmd_cd
+    dq rm_cmd, rm_cmd_end - rm_cmd, cmd_rm
     dq net_cmd, net_cmd_end - net_cmd, cmd_net
     dq 0
 
@@ -51,6 +53,8 @@ command_descriptions:
     dq desc_ls,       desc_ls_end - desc_ls
     dq desc_dir,      desc_dir_end - desc_dir
     dq desc_cat,      desc_cat_end - desc_cat
+    dq desc_cd,       desc_cd_end - desc_cd
+    dq desc_rm,       desc_rm_end - desc_rm
     dq desc_net,      desc_net_end - desc_net
 
 desc_echo db "print text, or write it to a file: echo <text> [> <filename>] (FAT/exFAT/NTFS, long names)"
@@ -101,6 +105,10 @@ desc_dir db "same as ls"
 desc_dir_end:
 desc_cat db "print a file's contents: cat <filename> (FAT/exFAT/NTFS)"
 desc_cat_end:
+desc_cd db "change directory on the USB drive: cd [<dir>|..|/] (FAT16/32/exFAT/NTFS)"
+desc_cd_end:
+desc_rm db "delete a file, or a directory tree with -r: rm [-r] <name> (FAT16/32/exFAT/NTFS)"
+desc_rm_end:
 desc_net db "show cached network link and DHCP status"
 desc_net_end:
 
@@ -167,6 +175,16 @@ fs_no_fat_msg db "No FAT/exFAT/NTFS filesystem found on the USB device.", 0
 fs_dir_tag_msg db "<DIR>", 0
 cat_usage_msg db "Usage: cat <filename>", 0
 fs_cat_notfound_msg db "cat: file not found", 0
+cd_notfound_msg db "cd: directory not found", 0
+cd_toodeep_msg db "cd: path too deep (max 16 levels)", 0
+cd_unsupported_msg db "cd: FAT12 volumes are not supported", 0
+rm_usage_msg db "Usage: rm [-r] <name>", 0
+rm_notfound_msg db "rm: not found", 0
+rm_isdir_msg db "rm: is a directory (use rm -r)", 0
+rm_dots_msg db "rm: cannot remove '.' or '..'", 0
+rm_unsupported_msg db "rm: FAT12 volumes are not supported", 0
+rm_toobig_msg db "rm: directory tree too large (partially removed)", 0
+rm_ntfs_btree_msg db "rm: NTFS entry is a b-tree branch node, unsupported", 0
 echo_redir_usage_msg db "Usage: echo <text> > <filename>", 0
 fs_echo_unsupported_msg db "echo: only FAT16/32/exFAT write is supported (found NTFS, or FAT12 volume)", 0
 fs_echo_nospace_msg db "echo: no free directory entry or cluster", 0
