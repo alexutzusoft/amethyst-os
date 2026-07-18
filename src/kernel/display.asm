@@ -443,6 +443,16 @@ mouse_isr:
     push rsi
     push rdi
 
+    ; Same spurious-IRQ guard as keyboard_isr: only read the data port if a
+    ; byte is pending AND it's flagged as aux (mouse) data, so a latched
+    ; stale IRQ12 edge can't make us eat a keyboard byte (or QEMU's
+    ; last-byte-replay on an empty buffer) as packet data.
+    in al, KBD_CMD_PORT
+    test al, KBD_STATUS_OUTPUT_FULL
+    jz .eoi
+    test al, KBD_STATUS_AUX_DATA
+    jz .eoi
+
     in al, KBD_DATA_PORT
     movzx rbx, byte [mouse_packet_idx]
     cmp bl, 0

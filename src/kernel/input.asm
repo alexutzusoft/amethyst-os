@@ -7,6 +7,18 @@ keyboard_isr:
     push rsi
     push rdi
 
+    ; The polled 8042 init (enable_kbd_irq/mouse_detect_wheel) leaves IRQ1
+    ; edges latched in the PIC IRR even though the bytes were consumed, and
+    ; QEMU's 8042 returns the LAST byte read when the output buffer is empty
+    ; (e.g. the 0x03 mouse device ID -> phantom '2'). So verify a keyboard
+    ; byte is actually pending before reading the data port: buffer full and
+    ; not flagged as aux (mouse) data.
+    in al, KBD_CMD_PORT
+    test al, KBD_STATUS_OUTPUT_FULL
+    jz .eoi                        ; spurious IRQ1: nothing pending
+    test al, KBD_STATUS_AUX_DATA
+    jnz .eoi                       ; mouse byte: leave it for the IRQ12 handler
+
     in al, KBD_DATA_PORT
     mov bl, al                     ; bl = raw scancode, break bit included
 

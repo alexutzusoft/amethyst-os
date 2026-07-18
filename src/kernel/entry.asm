@@ -93,6 +93,7 @@ long_mode_start:
     mov rax, [cursor_pos]
     mov [line_start_pos], rax
 
+    call flush_8042_output          ; drop stale 8042 bytes (e.g. mouse ID) before IRQs go live
     sti
 .idle:
     hlt

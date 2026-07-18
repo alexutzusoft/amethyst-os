@@ -135,6 +135,23 @@ kbd_wait_output:
     jz kbd_wait_output
     ret
 
+; --- Discard any byte genuinely left in the 8042's shared output buffer
+; before `sti`, so it can't be handed to keyboard_isr as a keystroke. Note
+; this does NOT cover the latched-IRQ case (the polled init above pulses
+; IRQ1/IRQ12 edges that stay latched in the PIC IRR even after the bytes are
+; consumed) - that's handled by the status-register guards at the top of
+; keyboard_isr/mouse_isr. Safe to drain here: all controller setup is polled
+; and mouse data reporting is still off, so nothing pending is needed. ---
+flush_8042_output:
+    in al, KBD_CMD_PORT
+    test al, KBD_STATUS_OUTPUT_FULL
+    jz .done
+    in al, KBD_DATA_PORT            ; read and discard the stale byte
+    call io_wait
+    jmp flush_8042_output
+.done:
+    ret
+
 ; --- Enable the 8042 aux (mouse) port and its IRQ12 line. Data reporting
 ; is left off (the mouse default) until the "cursor on" command sends
 ; MOUSE_CMD_ENABLE_REPORTING, so nothing streams unless opted into. ---
