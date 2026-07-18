@@ -10,3 +10,9 @@ KLAT.md
 GEMINI.md
 CODEX.md
 AGENTS.md
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
