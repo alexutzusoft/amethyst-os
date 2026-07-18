@@ -12,6 +12,7 @@ CODEX.md
 AGENTS.md
 
 # Python
+tests/.cache/
 __pycache__/
 *.py[cod]
 *$py.class

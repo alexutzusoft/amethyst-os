@@ -131,8 +131,14 @@ fs_bulk_go:
     mov [rsi + 16], esi              ; LINK back to ring start
     mov dword [rsi + 20], 0
     mov dword [rsi + 24], 0
+    ; The link TRB takes the INVERTED cycle bit: the controller parks its
+    ; dequeue pointer on this link after each transfer, so it must only
+    ; become valid once the next call has rewritten the ring. Giving it the
+    ; current cycle would leave a lazily-fetching controller (QEMU's xHCI)
+    ; parked on a link whose cycle it no longer accepts, hanging the ring.
     mov eax, (6 << 10) | (1 << 1)    ; LINK, TC=1
     or eax, r9d
+    xor eax, 1
     mov [rsi + 28], eax
     mov eax, r10d
     shl eax, 2
